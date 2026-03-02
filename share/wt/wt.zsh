@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # wt.zsh — Shell integration for wt (git worktree dashboard)
 #
 # Source this file in your .zshrc to enable cd support:
