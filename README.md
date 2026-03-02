@@ -27,7 +27,7 @@ ln -s "$PWD/wt" /usr/local/bin/wt
 echo 'source /path/to/wt/share/wt/wt.zsh' >> ~/.zshrc
 ```
 
-### Homebrew (coming soon)
+### Homebrew
 
 ```bash
 brew install ashwch/tap/wt
