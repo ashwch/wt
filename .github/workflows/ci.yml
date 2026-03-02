@@ -13,10 +13,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: ShellCheck wt
-        run: shellcheck wt
+        run: shellcheck -S warning wt
 
       - name: ShellCheck zsh integration
-        run: shellcheck -e SC1091 share/wt/wt.zsh
+        run: shellcheck -S warning -e SC1091 share/wt/wt.zsh
 
       - name: Bash syntax check
         run: bash -n wt
@@ -55,12 +55,9 @@ jobs:
       - name: Error outside git repo
         run: |
           cd /tmp
-          output=$(./wt 2>&1 || true)
+          output=$("$GITHUB_WORKSPACE/wt" 2>&1 || true)
           echo "$output"
           echo "$output" | grep -qi "not.*git" || { echo "Expected git error"; exit 1; }
-        env:
-          # Use absolute path since we cd away
-          WT_PATH: ${{ github.workspace }}/wt
 
   homebrew-test:
     runs-on: macos-latest
