@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck wt
+        run: shellcheck wt
+
+      - name: ShellCheck zsh integration
+        run: shellcheck -e SC1091 share/wt/wt.zsh
+
+      - name: Bash syntax check
+        run: bash -n wt
+
+      - name: Zsh syntax check
+        run: zsh -n share/wt/wt.zsh
+
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fzf
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update && sudo apt-get install -y fzf
+          else
+            brew install fzf
+          fi
+
+      - name: Verify --version
+        run: |
+          output=$(./wt --version)
+          echo "$output"
+          [[ "$output" == "wt 0."* ]] || { echo "Unexpected version output"; exit 1; }
+
+      - name: Verify --help
+        run: |
+          output=$(./wt --help)
+          echo "$output"
+          echo "$output" | grep -q "USAGE" || { echo "Missing USAGE in help"; exit 1; }
+
+      - name: Error outside git repo
+        run: |
+          cd /tmp
+          output=$(./wt 2>&1 || true)
+          echo "$output"
+          echo "$output" | grep -qi "not.*git" || { echo "Expected git error"; exit 1; }
+        env:
+          # Use absolute path since we cd away
+          WT_PATH: ${{ github.workspace }}/wt
+
+  homebrew-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Audit formula
+        run: |
+          brew tap ashwch/tap
+          brew audit --strict wt || true
+
+  release-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version in CHANGELOG
+        run: |
+          version=$(grep 'VERSION=' wt | head -1 | cut -d'"' -f2)
+          grep -q "## \[$version\]" CHANGELOG.md || {
+            echo "ERROR: Version $version not found in CHANGELOG.md"
+            exit 1
+          }

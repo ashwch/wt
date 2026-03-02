@@ -1,0 +1,963 @@
+#!/usr/bin/env bash
+#
+# wt - Interactive git worktree dashboard
+#
+# Features:
+#   - Browse all worktrees with fzf TUI
+#   - Preview panel with branch, commits, submodules, status
+#   - Create, delete, pull, and open worktrees with keybindings
+#   - Shell integration for cd support
+#
+# Usage:
+#   wt              Auto-detect repo from $PWD
+#   wt <path>       Use specific repo path
+#   wt -h|--help    Show help
+#
+# Requirements: git, fzf (0.38+)
+#
+
+set -euo pipefail
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+readonly VERSION="0.1.0"
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+
+# Resolve absolute path to this script for fzf callbacks
+_resolve_self() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ "$source" != /* ]] && source="$dir/$source"
+    done
+    echo "$(cd -P "$(dirname "$source")" && pwd)/$(basename "$source")"
+}
+readonly SELF="$(_resolve_self)"
+
+# Colors
+readonly RED=$'\033[31m'
+readonly GREEN=$'\033[32m'
+readonly BLUE=$'\033[34m'
+readonly YELLOW=$'\033[33m'
+readonly DIM=$'\033[2m'
+readonly BOLD=$'\033[1m'
+readonly NC=$'\033[0m'
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+die() {
+    echo "${RED}error:${NC} $*" >&2
+    exit 1
+}
+
+warn() {
+    echo "${YELLOW}warning:${NC} $*" >&2
+}
+
+canonical_path() {
+    # Resolve symlinks without GNU realpath (unavailable on older macOS).
+    # Handles /tmp → /private/tmp symlink that breaks path comparisons.
+    if [[ -d "$1" ]]; then
+        (cd -P "$1" 2>/dev/null && pwd) || echo "$1"
+    elif [[ -e "$1" ]]; then
+        local dir base
+        dir=$(cd -P "$(dirname "$1")" 2>/dev/null && pwd) || { echo "$1"; return; }
+        base=$(basename "$1")
+        echo "$dir/$base"
+    else
+        echo "$1"
+    fi
+}
+
+shorten_path() {
+    echo "${1/#$HOME/~}"
+}
+
+truncate_str() {
+    local str="$1" max="$2"
+    if (( ${#str} > max )); then
+        echo "${str:0:$((max - 1))}…"
+    else
+        echo "$str"
+    fi
+}
+
+# Convert unix timestamp to compact relative time: 1709312400 → "3d ago"
+timestamp_to_relative() {
+    local ts="$1" now="$2"
+    local diff=$(( now - ts ))
+
+    if (( diff < 0 )); then       echo "now"
+    elif (( diff < 60 )); then    echo "${diff}s ago"
+    elif (( diff < 3600 )); then  echo "$(( diff / 60 ))m ago"
+    elif (( diff < 86400 )); then echo "$(( diff / 3600 ))h ago"
+    elif (( diff < 604800 )); then    echo "$(( diff / 86400 ))d ago"
+    elif (( diff < 2592000 )); then   echo "$(( diff / 604800 ))w ago"
+    elif (( diff < 31536000 )); then  echo "$(( diff / 2592000 ))mo ago"
+    else                              echo "$(( diff / 31536000 ))y ago"
+    fi
+}
+
+# Find the most recent commit across a worktree and all its submodules.
+#
+# In monorepos the worktree HEAD is often just a pointer-bump commit like
+# "Bump backend submodule". The real work happens inside the submodules.
+# This function looks at BOTH the worktree HEAD and every submodule HEAD,
+# then returns whichever commit is newest — giving you the actual latest
+# activity regardless of where it happened.
+#
+# Returns a single tab-delimited line (no trailing newline):
+#   <unix_timestamp>\t<commit_subject>\t<source>
+#
+# Parse it in the caller with:
+#   IFS=$'\t' read -r ts subject source <<< "$(get_newest_commit ...)"
+#
+# The <source> field tells you WHERE the commit came from:
+#   ""           → the worktree itself (its own HEAD)
+#   "backend"    → the "backend" submodule had the newest commit
+#
+# For repos without submodules, this simply returns the worktree HEAD info.
+#
+# Uses printf (not echo) to avoid a trailing newline — command substitution
+# in the caller strips it cleanly, and IFS+read parses the tabs.
+get_newest_commit() {
+    local wt_path="$1" head_sha="$2" git_ctx="$3"
+
+    # Start with the worktree's own HEAD commit.
+    # --format=$'%ct\t%s' gives us "unix_timestamp<TAB>subject" in one call.
+    local mono_info
+    mono_info=$(git -C "$git_ctx" log -1 --format=$'%ct\t%s' "$head_sha" 2>/dev/null) || { printf '0\t—\t'; return; }
+
+    # Split on TAB using bash parameter expansion (no subprocess):
+    #   ${var%%<TAB>*}  → everything BEFORE the first tab  (timestamp)
+    #   ${var#*<TAB>}   → everything AFTER the first tab   (subject)
+    local max_ts="${mono_info%%	*}"
+    local max_subject="${mono_info#*	}"
+    local max_source=""
+
+    # No submodules? The worktree HEAD is all we have.
+    if [[ ! -d "$wt_path" || ! -f "$wt_path/.gitmodules" ]]; then
+        printf '%s\t%s\t%s' "$max_ts" "$max_subject" "$max_source"
+        return
+    fi
+
+    # Walk each submodule and keep the newest commit.
+    # Uses -z for NUL-delimited output so paths with spaces parse correctly.
+    # Each entry is "key\nvalue\0" — we split on NUL, then extract the value
+    # (everything after the first newline).
+    local sub_path sub_info sub_ts entry
+    while IFS= read -r -d '' entry; do
+        [[ -z "$entry" ]] && continue
+        sub_path="${entry#*$'\n'}"
+        [[ -d "$wt_path/$sub_path" ]] || continue
+        sub_info=$(git -C "$wt_path/$sub_path" log -1 --format=$'%ct\t%s' HEAD 2>/dev/null) || continue
+        sub_ts="${sub_info%%	*}"
+        if (( sub_ts > max_ts )); then
+            max_ts="$sub_ts"
+            max_subject="${sub_info#*	}"
+            max_source="$sub_path"
+        fi
+    done < <(git -C "$wt_path" config --file .gitmodules -z --get-regexp 'submodule\..*\.path' 2>/dev/null)
+
+    printf '%s\t%s\t%s' "$max_ts" "$max_subject" "$max_source"
+}
+
+# Resolve a meaningful name for a detached HEAD worktree
+resolve_detached_name() {
+    local wt_path="$1"
+
+    if [[ ! -d "$wt_path" ]]; then
+        echo "(detached)"
+        return
+    fi
+
+    # git describe --all finds the nearest ref (branch, tag, remote)
+    # --always falls back to short SHA if nothing else matches
+    local ref
+    ref=$(git -C "$wt_path" describe --all --always HEAD 2>/dev/null) || ref=""
+
+    if [[ -n "$ref" ]]; then
+        # Strip verbose prefixes: heads/main → main, remotes/origin/dev → origin/dev
+        ref="${ref#heads/}"
+        ref="${ref#remotes/}"
+        ref="${ref#tags/}"
+        echo "$ref"
+    else
+        echo "(detached)"
+    fi
+}
+
+# =============================================================================
+# Worktree Parsing
+# =============================================================================
+
+# Parses `git worktree list --porcelain` into parallel arrays.
+# Sets: WT_PATHS, WT_HEADS, WT_BRANCHES, WT_STATES, WT_LOCKED
+parse_worktrees() {
+    local git_args=("worktree" "list" "--porcelain")
+    [[ -n "${REPO_PATH:-}" ]] && git_args=("-C" "$REPO_PATH" "${git_args[@]}")
+
+    WT_PATHS=()
+    WT_HEADS=()
+    WT_BRANCHES=()
+    WT_STATES=()
+    WT_LOCKED=()
+
+    local path="" head="" branch="" state="branch" locked=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ -z "$line" ]]; then
+            if [[ -n "$path" ]]; then
+                WT_PATHS+=("$(canonical_path "$path")")
+                WT_HEADS+=("$head")
+                WT_BRANCHES+=("$branch")
+                WT_STATES+=("$state")
+                WT_LOCKED+=("$locked")
+            fi
+            path="" head="" branch="" state="branch" locked=""
+            continue
+        fi
+
+        case "$line" in
+            worktree\ *)  path="${line#worktree }" ;;
+            HEAD\ *)      head="${line#HEAD }" ;;
+            branch\ *)    branch="${line#branch refs/heads/}" ;;
+            detached)     state="detached" ;;
+            prunable*)    state="prunable" ;;
+            locked*)      locked="yes" ;;
+        esac
+    done < <(git "${git_args[@]}")
+
+    # Handle last block (porcelain output may not end with a blank line)
+    if [[ -n "$path" ]]; then
+        WT_PATHS+=("$(canonical_path "$path")")
+        WT_HEADS+=("$head")
+        WT_BRANCHES+=("$branch")
+        WT_STATES+=("$state")
+        WT_LOCKED+=("$locked")
+    fi
+}
+
+# =============================================================================
+# List Command
+# =============================================================================
+
+# Outputs tab-delimited rows for fzf, sorted by most recent activity.
+# Field 1 (hidden): full worktree path
+# Field 2 (visible): icon, branch, age, commit, short_name
+cmd_list() {
+    # Validate repo before parsing — --list can be called directly by fzf
+    # reload, so we can't rely on main() having validated first.
+    if [[ -n "${REPO_PATH:-}" ]]; then
+        git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1 \
+            || { die "Not a git repository: $REPO_PATH"; }
+    else
+        git rev-parse --git-dir >/dev/null 2>&1 \
+            || { die "Not inside a git repository"; }
+    fi
+
+    parse_worktrees
+
+    if (( ${#WT_PATHS[@]} == 0 )); then
+        return
+    fi
+
+    # Find a valid worktree path for git log lookups (all share the same object store)
+    local git_ctx=""
+    for wt in "${WT_PATHS[@]}"; do
+        [[ -d "$wt" ]] && { git_ctx="$wt"; break; }
+    done
+
+    # Compute common directory prefix — strip shared noise from path column
+    local common_prefix=""
+    if (( ${#WT_PATHS[@]} > 1 )); then
+        common_prefix="${WT_PATHS[0]}"
+        local j
+        for (( j = 1; j < ${#WT_PATHS[@]}; j++ )); do
+            while [[ "${WT_PATHS[$j]}" != "$common_prefix"* ]]; do
+                common_prefix="${common_prefix%/*}"
+            done
+        done
+        [[ -n "$common_prefix" && "$common_prefix" != */ ]] && common_prefix="$common_prefix/"
+    fi
+
+    local now current_wt i
+    now=$(date +%s)
+    current_wt=$(canonical_path "${PWD:-}")
+
+    # Collect rows with sort key: "timestamp\x1fformatted_row"
+    local rows=()
+
+    for (( i = 0; i < ${#WT_PATHS[@]}; i++ )); do
+        local path="${WT_PATHS[$i]}"
+        local head="${WT_HEADS[$i]}"
+        local branch="${WT_BRANCHES[$i]}"
+        local state="${WT_STATES[$i]}"
+
+        # Determine icon and color — current worktree takes priority
+        local icon color is_current=false
+
+        if [[ -n "$current_wt" && ( "$current_wt" == "$path" || "$current_wt" == "$path/"* ) ]]; then
+            is_current=true
+        fi
+
+        if $is_current; then
+            icon="●" color="$GREEN"
+        else
+            case "$state" in
+                prunable)  icon="✗" color="$RED" ;;
+                detached)  icon="◌" color="$YELLOW" ;;
+                *)         icon="○" color="$BLUE" ;;
+            esac
+        fi
+
+        # Locked worktrees override the icon
+        if [[ -n "${WT_LOCKED[$i]}" ]]; then
+            icon="🔒" color="$DIM"
+        fi
+
+        # Branch display — resolve detached HEADs to nearest ref
+        local branch_display
+        case "$state" in
+            prunable) branch_display="(prunable)" ;;
+            detached) branch_display=$(resolve_detached_name "$path") ;;
+            *)        branch_display="$branch" ;;
+        esac
+        branch_display=$(truncate_str "$branch_display" 24)
+
+        # Most recent activity across worktree + submodules.
+        # get_newest_commit returns timestamp, subject, and which repo the
+        # commit came from — all in one call. We parse with IFS+read (a
+        # bash builtin) to avoid subprocess forks per worktree.
+        local max_ts=0 age="—" subject="—"
+        if [[ -n "$head" && -n "$git_ctx" ]]; then
+            local raw_subject raw_source
+            IFS=$'\t' read -r max_ts raw_subject raw_source <<< "$(get_newest_commit "$path" "$head" "$git_ctx")"
+
+            if [[ "$max_ts" != "0" ]]; then
+                age=$(timestamp_to_relative "$max_ts" "$now")
+            fi
+
+            # When the newest commit is from a submodule, prefix the subject
+            # so the user can see at a glance where the work happened:
+            #   "backend: fix auth refresh"  (submodule source → prefixed)
+            #   "update CI config"           (worktree itself → no prefix)
+            if [[ -n "$raw_source" ]]; then
+                subject=$(truncate_str "${raw_source}: ${raw_subject}" 40)
+            else
+                subject=$(truncate_str "$raw_subject" 40)
+            fi
+        fi
+
+        # Path display — strip common prefix to show just the unique name
+        local display_path
+        if [[ -n "$common_prefix" ]]; then
+            display_path="${path#"$common_prefix"}"
+        else
+            display_path=$(shorten_path "$path")
+        fi
+
+        # Collect: sort_key\x1fformatted_row
+        local row
+        row=$(printf "%s\x1f %s%s %-24s%s  %s%-10s%s  %-40s  %s%s%s" \
+            "$path" \
+            "$color" "$icon" "$branch_display" "$NC" \
+            "$DIM" "$age" "$NC" \
+            "$subject" \
+            "$DIM" "$display_path" "$NC")
+
+        rows+=("${max_ts}"$'\x1f'"${row}")
+    done
+
+    # Sort by timestamp descending (most recent first) and output
+    printf '%s\n' "${rows[@]}" | sort -t$'\x1f' -k1,1 -rn | cut -d$'\x1f' -f2-
+}
+
+# =============================================================================
+# Preview Command
+# =============================================================================
+
+section_header() {
+    local title="$1"
+    local width=48
+    local pad=$(( width - ${#title} - 5 ))
+    (( pad < 2 )) && pad=2
+    printf "\n%s─── %s %s%s\n" "$BOLD" "$title" "$(printf '─%.0s' $(seq 1 "$pad"))" "$NC"
+}
+
+cmd_preview() {
+    local wt_path="$1"
+
+    if [[ ! -d "$wt_path" ]]; then
+        echo "${RED}Worktree directory does not exist${NC}"
+        echo "${DIM}This worktree may need to be pruned.${NC}"
+        return
+    fi
+
+    # ── Branch ──────────────────────────────────────────
+    section_header "Branch"
+    local branch
+    branch=$(git -C "$wt_path" symbolic-ref --short HEAD 2>/dev/null || echo "(detached HEAD)")
+    printf "  %s%s%s\n" "$BOLD" "$branch" "$NC"
+
+    # ── Latest Activity ─────────────────────────────────
+    # A unified timeline showing the most recent commits from the worktree
+    # AND all its submodules, sorted by recency. This gives a complete
+    # picture of recent work — in monorepos, most development happens
+    # inside submodules, so showing only the worktree's own commits would
+    # miss the real activity.
+    #
+    # Output (top 5 entries):
+    #   2h ago     a1b2c3d  fix: auth token refresh               backend
+    #   1d ago     e4f5g6h  feat: new dashboard card               frontend
+    #   3d ago     i7j8k9l  Bump backend pointer
+    #
+    # Worktree commits have no label (they're implied).
+    # Submodule commits show their source name right-aligned in dim text.
+    #
+    # For repos without submodules this just shows the worktree's own
+    # recent commits — no label column, nothing different.
+    section_header "Latest Activity"
+    local now_ts activity_lines=()
+    now_ts=$(date +%s)
+
+    # Worktree's own commits (top 3).
+    # --format=$'%ct\t%h\t%s' gives us "timestamp<TAB>short_hash<TAB>subject".
+    # IFS=$'\t' splits on tabs; the last var (csubj) captures the full
+    # subject even if it somehow contains tabs.
+    while IFS=$'\t' read -r cts chash csubj; do
+        [[ -z "$cts" ]] && continue
+        local crel
+        crel=$(timestamp_to_relative "$cts" "$now_ts")
+        csubj=$(truncate_str "$csubj" 36)
+        # Each entry is stored as "timestamp\x1fformatted_line" so we can
+        # sort everything by recency later. \x1f (Unit Separator) is safe —
+        # it never appears in ANSI codes or git output.
+        activity_lines+=("${cts}"$'\x1f'"$(printf "  %-10s  ${YELLOW}%s${NC}  %-36s" "$crel" "$chash" "$csubj")")
+    done < <(git -C "$wt_path" log -3 --format=$'%ct\t%h\t%s' 2>/dev/null)
+
+    # Submodule commits (top 1 each) — only if submodules exist.
+    # We grab 1 commit per submodule to avoid flooding the timeline.
+    # Submodule paths are read from .gitmodules config (cheap, no checkout
+    # needed), then we git-log only initialized ones.
+    if [[ -f "$wt_path/.gitmodules" ]]; then
+        local sub_path entry
+        while IFS= read -r -d '' entry; do
+            [[ -z "$entry" ]] && continue
+            sub_path="${entry#*$'\n'}"
+            [[ -d "$wt_path/$sub_path" ]] || continue
+            while IFS=$'\t' read -r sts shash ssubj; do
+                [[ -z "$sts" ]] && continue
+                local srel
+                srel=$(timestamp_to_relative "$sts" "$now_ts")
+                ssubj=$(truncate_str "$ssubj" 28)
+                # Submodule entries include the source name so the user can
+                # tell which repo the commit came from.
+                activity_lines+=("${sts}"$'\x1f'"$(printf "  %-10s  ${YELLOW}%s${NC}  %-28s  ${DIM}%s${NC}" "$srel" "$shash" "$ssubj" "$sub_path")")
+            done < <(git -C "$wt_path/$sub_path" log -1 --format=$'%ct\t%h\t%s' HEAD 2>/dev/null)
+        done < <(git -C "$wt_path" config --file .gitmodules -z --get-regexp 'submodule\..*\.path' 2>/dev/null)
+    fi
+
+    if (( ${#activity_lines[@]} == 0 )); then
+        echo "  ${DIM}No commits${NC}"
+    else
+        # Merge-sort all entries by timestamp (descending), take top 5.
+        printf '%s\n' "${activity_lines[@]}" | sort -t$'\x1f' -k1,1 -rn | head -5 | cut -d$'\x1f' -f2-
+    fi
+
+    # ── Submodules ──────────────────────────────────────
+    # Per-submodule detail showing sync state, branch, and latest commit
+    # at a glance. Each initialized submodule is a mini git repo, so we
+    # query it for the info you'd normally need to cd into it to see.
+    #
+    # Output:
+    #   ✗ *backend            dev            2h ago   fix: auth token refresh
+    #   ✓  design-system      v1.90.0        3w ago   chore: bump deps
+    #   !  serverless         (not initialized)
+    #   ✓  frontend           feat/dash      1d ago   feat: new dashboard card
+    #
+    # Columns:
+    #   Icon    ✓ green = synced, ✗ red = diverged, ! yellow = not initialized
+    #           (from `git submodule status` prefix: " "=synced, "+"=diverged, "-"=uninit)
+    #   Dirty   * yellow if working tree has staged/unstaged changes, blank if clean
+    #           (from `git diff-index --quiet HEAD` — fast, skips untracked files)
+    #   Name    submodule path
+    #   Branch  current branch via `git symbolic-ref --short HEAD`
+    #           falls back to `git describe --all --always` for detached/tagged states
+    #   Age     relative time of the latest commit (uses shared now_ts from Latest Activity)
+    #   Subject first line of the latest commit message, truncated to 28 chars
+    #
+    # Not-initialized submodules ("-" prefix from `git submodule status`)
+    # have no checkout on disk, so we can only show "(not initialized)".
+    if [[ -f "$wt_path/.gitmodules" ]]; then
+        section_header "Submodules"
+
+        # `git submodule status` output format (one line per submodule):
+        #   <prefix><40-char-sha> <path> (<describe>)
+        # where prefix is: " " (synced), "+" (diverged), "-" (not initialized)
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local prefix="${line:0:1}"
+            local rest="${line:1}"
+            # After stripping the 1-char prefix, format is:
+            #   <40-char-sha> <path> (<describe>)
+            # Skip the 40-char SHA + space, then strip optional trailing
+            # " (describe)" to get the full path (which may contain spaces).
+            local name
+            name="${rest:41}"
+            name="${name% (*}"
+
+            # Not-initialized submodules — no git data available
+            if [[ "$prefix" == "-" ]]; then
+                printf "  ${YELLOW}!${NC} %-20s ${DIM}(not initialized)${NC}\n" "$name"
+                continue
+            fi
+
+            # Sync icon — "+" means the checked-out SHA differs from what
+            # the superproject recorded (i.e. local submodule changes).
+            local sync_icon
+            if [[ "$prefix" == "+" ]]; then
+                sync_icon="${RED}✗${NC}"
+            else
+                sync_icon="${GREEN}✓${NC}"
+            fi
+
+            local sub_dir="$wt_path/$name"
+
+            # Dirty marker — `git diff-index --quiet HEAD` exits non-zero
+            # when there are staged OR unstaged changes (but not untracked
+            # files). This is fast because it only stats tracked files.
+            local dirty=" "
+            if [[ -d "$sub_dir" ]]; then
+                git -C "$sub_dir" diff-index --quiet HEAD 2>/dev/null || dirty="${YELLOW}*${NC}"
+            fi
+
+            # Branch — try symbolic-ref first (gives "main", "feat/dash"),
+            # fall back to describe --all --always for detached/tagged states
+            # (gives "v1.90.0", "origin/main", or a short SHA as last resort).
+            # We strip verbose prefixes that describe adds (heads/, remotes/, tags/).
+            local sub_branch=""
+            if [[ -d "$sub_dir" ]]; then
+                sub_branch=$(git -C "$sub_dir" symbolic-ref --short HEAD 2>/dev/null) \
+                    || sub_branch=$(git -C "$sub_dir" describe --all --always HEAD 2>/dev/null | sed 's|^heads/||;s|^remotes/||;s|^tags/||') \
+                    || sub_branch=""
+            fi
+            sub_branch=$(truncate_str "${sub_branch:-???}" 16)
+
+            # Age + subject from the submodule's latest commit.
+            # Same tab-split + parameter expansion pattern used in
+            # get_newest_commit(). now_ts comes from the Latest Activity
+            # section above so all relative times use a consistent "now".
+            local sub_age="—" sub_subject="—"
+            if [[ -d "$sub_dir" ]]; then
+                local sub_log
+                sub_log=$(git -C "$sub_dir" log -1 --format=$'%ct\t%s' HEAD 2>/dev/null) || sub_log=""
+                if [[ -n "$sub_log" ]]; then
+                    local sub_ts="${sub_log%%	*}"
+                    sub_subject="${sub_log#*	}"
+                    sub_age=$(timestamp_to_relative "$sub_ts" "$now_ts")
+                    sub_subject=$(truncate_str "$sub_subject" 28)
+                fi
+            fi
+
+            printf "  %s %s%-20s %s%-16s  %-8s  %s\n" \
+                "$sync_icon" "$dirty" "$name" "$DIM" "$sub_branch" "$sub_age" "${sub_subject}${NC}"
+        done < <(git -C "$wt_path" submodule status 2>/dev/null)
+    fi
+
+    # ── Working Tree ────────────────────────────────────
+    section_header "Working Tree"
+    local modified=0 untracked=0 staged=0
+    while IFS= read -r status_line; do
+        [[ -z "$status_line" ]] && continue
+        local xy="${status_line:0:2}"
+        case "$xy" in
+            '??') (( untracked++ )) ;;
+            *)
+                [[ "${xy:0:1}" != " " && "${xy:0:1}" != "?" ]] && (( staged++ )) || true
+                [[ "${xy:1:1}" != " " && "${xy:1:1}" != "?" ]] && (( modified++ )) || true
+                ;;
+        esac
+    done < <(git -C "$wt_path" status --porcelain 2>/dev/null)
+
+    if (( modified + untracked + staged == 0 )); then
+        printf "  ${GREEN}Clean${NC}\n"
+    else
+        local summary=""
+        (( staged > 0 )) && summary+="${GREEN}$staged staged${NC}"
+        if (( modified > 0 )); then
+            [[ -n "$summary" ]] && summary+=", "
+            summary+="${YELLOW}$modified modified${NC}"
+        fi
+        if (( untracked > 0 )); then
+            [[ -n "$summary" ]] && summary+=", "
+            summary+="${DIM}$untracked untracked${NC}"
+        fi
+        printf "  %s\n" "$summary"
+    fi
+}
+
+# =============================================================================
+# Actions (called from fzf keybindings via self-invocation)
+# =============================================================================
+
+action_new() {
+    local wt_path="$1"
+
+    if [[ ! -d "$wt_path" ]]; then
+        echo "${RED}Cannot create from a missing worktree. Prune the stale entry first.${NC}"
+        return
+    fi
+
+    local base
+    base=$(dirname "$wt_path")
+
+    printf "${BOLD}New branch name: ${NC}"
+    local branch
+    read -r branch
+
+    if [[ -z "$branch" ]]; then
+        echo "Cancelled."
+        return
+    fi
+
+    local new_path="$base/$branch"
+    printf "Creating worktree at %s...\n" "$(shorten_path "$new_path")"
+    git -C "$wt_path" worktree add "$new_path" -b "$branch" 2>&1
+    echo "${GREEN}✓${NC} Created"
+}
+
+action_delete() {
+    local wt_path
+    wt_path=$(canonical_path "$1")
+    local short_path
+    short_path=$(shorten_path "$wt_path")
+
+    # ── Prunable (directory already gone) ─────────────────────────────
+    if [[ ! -d "$wt_path" ]]; then
+        echo "${DIM}Directory does not exist — pruning stale entry.${NC}"
+        printf "${BOLD}Prune %s? [y/N] ${NC}" "$short_path"
+        read -r confirm
+        if [[ "$confirm" =~ ^[yY]$ ]]; then
+            # Find a sibling worktree FROM THE SAME REPO to run prune from.
+            # The parent dir isn't a git repo, so we scan siblings. We verify
+            # the stale path appears in the candidate's worktree list — without
+            # this, a sibling from a different repo would silently no-op prune.
+            local sibling="" parent_dir candidate
+            parent_dir=$(dirname "$wt_path")
+            for candidate in "$parent_dir"/*/; do
+                candidate="${candidate%/}"
+                [[ -d "$candidate" ]] || continue
+                git -C "$candidate" rev-parse --git-dir >/dev/null 2>&1 || continue
+                # Verify this checkout knows about the stale worktree
+                if git -C "$candidate" worktree list --porcelain 2>/dev/null \
+                        | grep -qxF "worktree $wt_path"; then
+                    sibling="$candidate"
+                    break
+                fi
+            done
+
+            if [[ -n "$sibling" ]]; then
+                git -C "$sibling" worktree prune 2>&1
+                echo "${GREEN}✓${NC} Pruned"
+            else
+                echo "${RED}Could not find a valid git context to prune from.${NC}"
+                echo "${DIM}Try: git worktree prune (from any checkout of this repo)${NC}"
+            fi
+        else
+            echo "Cancelled."
+        fi
+        return
+    fi
+
+    # ── Safety: can't remove the main worktree ────────────────────────
+    local main_wt
+    main_wt=$(git -C "$wt_path" worktree list --porcelain 2>/dev/null | head -1)
+    main_wt=$(canonical_path "${main_wt#worktree }")
+    if [[ "$wt_path" == "$main_wt" ]]; then
+        echo "${RED}Cannot remove the main worktree.${NC}"
+        return
+    fi
+
+    # ── Safety: can't remove the worktree you're standing in ──────────
+    local current
+    current=$(canonical_path "${PWD:-}")
+    if [[ "$current" == "$wt_path" || "$current" == "$wt_path/"* ]]; then
+        echo "${RED}Cannot remove the current worktree. cd elsewhere first.${NC}"
+        return
+    fi
+
+    # ── Safety: can't remove a locked worktree ───────────────────────
+    # Walk porcelain output to find this worktree's block, then check for
+    # a "locked" line before the next "worktree" block begins. Avoids
+    # regex (paths may contain special chars) and fixed-window grep.
+    local is_locked=false
+    local in_block=false
+    while IFS= read -r line; do
+        if [[ "$line" == "worktree "* ]]; then
+            if $in_block; then
+                break  # hit next worktree block — done
+            fi
+            [[ "${line#worktree }" == "$wt_path" ]] && in_block=true
+        elif $in_block && [[ "$line" == locked* ]]; then
+            is_locked=true
+        fi
+    done < <(git -C "$wt_path" worktree list --porcelain 2>/dev/null)
+    if $is_locked; then
+        echo "${RED}Cannot remove a locked worktree.${NC}"
+        echo "${DIM}Unlock with: git worktree unlock $(shorten_path "$wt_path")${NC}"
+        return
+    fi
+
+    # ── Gather state ──────────────────────────────────────────────────
+    local branch_name="" is_detached=false
+    branch_name=$(git -C "$wt_path" symbolic-ref --short HEAD 2>/dev/null) || is_detached=true
+
+    local status_output="" dirty_count=0
+    status_output=$(git -C "$wt_path" status --porcelain 2>/dev/null) || true
+    if [[ -n "$status_output" ]]; then
+        dirty_count=$(wc -l <<< "$status_output" | tr -d ' ')
+    fi
+
+    # ── Display worktree info ─────────────────────────────────────────
+    echo ""
+    echo "${BOLD}Worktree:${NC} $short_path"
+    if $is_detached; then
+        local head_sha
+        head_sha=$(git -C "$wt_path" rev-parse --short HEAD 2>/dev/null)
+        echo "${BOLD}HEAD:${NC}     ${YELLOW}detached at $head_sha${NC}"
+    else
+        echo "${BOLD}Branch:${NC}  $branch_name ${DIM}(branch will be preserved)${NC}"
+    fi
+
+    # ── Dirty working tree → require strong confirmation ──────────────
+    if (( dirty_count > 0 )); then
+        echo ""
+        echo "${YELLOW}⚠ $dirty_count uncommitted change(s) will be lost:${NC}"
+        head -10 <<< "$status_output" | while IFS= read -r line; do
+            echo "  ${DIM}$line${NC}"
+        done
+        (( dirty_count > 10 )) && echo "  ${DIM}… and $((dirty_count - 10)) more${NC}"
+
+        if $is_detached; then
+            echo ""
+            echo "${YELLOW}⚠ Detached HEAD — commits not on any branch may become unreachable.${NC}"
+            echo "  ${DIM}Consider: git -C $short_path checkout -b <name>${NC}"
+        fi
+
+        echo ""
+        echo "${RED}${BOLD}This will permanently delete uncommitted work.${NC}"
+        printf "${BOLD}Type 'delete' to confirm: ${NC}"
+        read -r confirm
+        if [[ "$confirm" == "delete" ]]; then
+            git -C "$main_wt" worktree remove --force "$wt_path" 2>&1
+            echo "${GREEN}✓${NC} Removed"
+        else
+            echo "Cancelled."
+        fi
+        return
+    fi
+
+    # ── Clean working tree ────────────────────────────────────────────
+    echo ""
+    if $is_detached; then
+        echo "${DIM}Working tree is clean.${NC}"
+        echo "${YELLOW}Note:${NC} Detached HEAD — commits not on any branch may become unreachable."
+        echo "  ${DIM}Consider: git -C $short_path checkout -b <name>${NC}"
+    else
+        echo "${DIM}Working tree is clean. Branch '$branch_name' will be preserved.${NC}"
+    fi
+
+    printf "${BOLD}Remove? [y/N] ${NC}"
+    read -r confirm
+    if [[ "$confirm" =~ ^[yY]$ ]]; then
+        git -C "$main_wt" worktree remove "$wt_path" 2>&1
+        echo "${GREEN}✓${NC} Removed"
+    else
+        echo "Cancelled."
+    fi
+}
+
+# =============================================================================
+# Help & Version
+# =============================================================================
+
+show_help() {
+    cat <<EOF
+${BOLD}wt${NC} v${VERSION} — Interactive git worktree dashboard
+
+${BOLD}USAGE${NC}
+    wt                  Auto-detect repo from \$PWD
+    wt <path>           Use specific repo path
+
+${BOLD}OPTIONS${NC}
+    -h, --help          Show this help
+    --version           Show version
+
+${BOLD}KEYBINDINGS${NC}
+    Enter               cd into selected worktree
+    Ctrl-O              Open in \$EDITOR
+    Ctrl-P              Pull latest (--ff-only)
+    Ctrl-N              Create new worktree
+    Ctrl-X              Delete worktree
+    Ctrl-R              Refresh list
+    Ctrl-/              Toggle preview panel
+
+${BOLD}ICONS${NC}
+    ●  Current worktree (\$PWD)
+    ○  Has branch
+    ◌  Detached HEAD
+    ✗  Prunable (stale)
+    🔒  Locked
+
+${BOLD}SHELL INTEGRATION${NC}
+    Source the zsh wrapper for cd support:
+        source /path/to/share/wt/wt.zsh
+
+${BOLD}REQUIREMENTS${NC}
+    git                 Required
+    fzf (0.38+)         Required (uses become())
+
+EOF
+}
+
+show_version() {
+    echo "wt ${VERSION}"
+}
+
+# =============================================================================
+# fzf Dashboard
+# =============================================================================
+
+launch_fzf() {
+    command -v fzf >/dev/null 2>&1 \
+        || die "fzf is required but not installed. Install with: brew install fzf"
+
+    local editor="${EDITOR:-vim}"
+
+    # Shell-escape paths for safe embedding in fzf command strings.
+    # printf '%q' produces a bash-quoted string that survives eval.
+    local self_q repo_q
+    self_q=$(printf '%q' "$SELF")
+
+    local list_cmd="$self_q --list"
+    if [[ -n "${REPO_PATH:-}" ]]; then
+        repo_q=$(printf '%q' "$REPO_PATH")
+        list_cmd="$list_cmd $repo_q"
+    fi
+
+    # Parse worktrees to compute common prefix for the header
+    parse_worktrees
+    local base_display=""
+    if (( ${#WT_PATHS[@]} > 1 )); then
+        local _prefix="${WT_PATHS[0]}"
+        local _j
+        for (( _j = 1; _j < ${#WT_PATHS[@]}; _j++ )); do
+            while [[ "${WT_PATHS[$_j]}" != "$_prefix"* ]]; do
+                _prefix="${_prefix%/*}"
+            done
+        done
+        [[ -n "$_prefix" ]] && base_display="$(shorten_path "$_prefix")"
+    fi
+
+    local list
+    list=$(cmd_list)
+
+    if [[ -z "$list" ]]; then
+        die "No worktrees found"
+    fi
+
+    local header=""
+    [[ -n "$base_display" ]] && header="  ${base_display}"$'\n'
+    header+="  enter:cd  ^o:editor  ^p:pull  ^n:new  ^x:delete  ^r:refresh  ^/:preview"
+
+    local result
+    result=$(echo "$list" | fzf \
+        --ansi \
+        --delimiter=$'\x1f' \
+        --with-nth=2 \
+        --preview="$self_q --preview {1}" \
+        --preview-window=right:50%:wrap \
+        --header="$header" \
+        --header-first \
+        --reverse \
+        --no-sort \
+        --no-multi \
+        --bind="enter:become(echo {1})" \
+        --bind="ctrl-o:execute($editor {1})" \
+        --bind="ctrl-p:execute(git -C {1} pull --ff-only)+reload($list_cmd)" \
+        --bind="ctrl-r:reload($list_cmd)" \
+        --bind="ctrl-n:execute($self_q --action-new {1} </dev/tty >/dev/tty 2>&1)+reload($list_cmd)" \
+        --bind="ctrl-x:execute($self_q --action-delete {1} </dev/tty >/dev/tty 2>&1)+reload($list_cmd)" \
+        --bind="ctrl-/:toggle-preview" \
+        --pointer="▶" \
+        --prompt="worktree▶ " \
+    ) || true
+
+    # Output result (path for cd wrapper, or empty on escape)
+    if [[ -n "$result" ]]; then
+        echo "$result"
+    fi
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main() {
+    REPO_PATH=""
+
+    case "${1:-}" in
+        -h|--help)
+            show_help
+            return 0
+            ;;
+        --version)
+            show_version
+            return 0
+            ;;
+        --preview)
+            cmd_preview "${2:?Missing worktree path for --preview}"
+            return 0
+            ;;
+        --list)
+            REPO_PATH="${2:-}"
+            cmd_list
+            return 0
+            ;;
+        --action-new)
+            action_new "${2:?Missing worktree path for --action-new}"
+            return 0
+            ;;
+        --action-delete)
+            action_delete "${2:?Missing worktree path for --action-delete}"
+            return 0
+            ;;
+        -*)
+            die "Unknown option: $1. See 'wt --help'."
+            ;;
+        *)
+            REPO_PATH="${1:-}"
+            ;;
+    esac
+
+    # Verify we're in a git repository
+    if [[ -n "$REPO_PATH" ]]; then
+        git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1 \
+            || die "Not a git repository: $REPO_PATH"
+    else
+        git rev-parse --git-dir >/dev/null 2>&1 \
+            || die "Not inside a git repository. Usage: wt [path]"
+    fi
+
+    launch_fzf
+}
+
+main "$@"
