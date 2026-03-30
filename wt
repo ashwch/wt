@@ -853,6 +853,15 @@ action_delete() {
         return 1
     fi
 
+    # `--action-delete` may be called directly by a user, so validate that the
+    # selected path is an actual worktree root before we rely on worktree
+    # porcelain output below. Without this guard, a plain directory can trip
+    # `set -e` and exit silently.
+    if ! worktree_known_to_git_context "$wt_path" "$wt_path"; then
+        echo "${RED}Not a git worktree:${NC} $short_path"
+        return 1
+    fi
+
     # ── Safety: can't remove the main worktree ────────────────────────
     local main_wt
     main_wt=$(git -C "$wt_path" worktree list --porcelain 2>/dev/null | head -1)
