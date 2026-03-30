@@ -191,7 +191,7 @@ delete_worktree_path() {
     for _attempt in 1 2 3; do
         [[ -e "$wt_path" ]] || return 0
 
-        if rm_output=$(rm -rf "$wt_path" 2>&1); then
+        if rm_output=$(rm -rf -- "$wt_path" 2>&1); then
             [[ -n "$rm_output" ]] && remove_output+="$rm_output"$'\n'
         else
             [[ -n "$rm_output" ]] && remove_output+="$rm_output"$'\n'
@@ -201,8 +201,8 @@ delete_worktree_path() {
 
         repair_delete_barriers "$wt_path"
 
-        if [[ -d "$wt_path" ]] && [[ -z "$(find "$wt_path" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
-            rmdir "$wt_path" 2>/dev/null || true
+        if [[ -d "$wt_path" ]] && [[ -z "$(find "$wt_path" -mindepth 1 -print -quit 2>/dev/null || true)" ]]; then
+            rmdir -- "$wt_path" 2>/dev/null || true
         fi
 
         [[ ! -e "$wt_path" ]] && return 0
@@ -831,7 +831,7 @@ action_delete() {
     short_path=$(shorten_path "$wt_path")
 
     # ── Prunable (directory already gone) ─────────────────────────────
-    if [[ ! -d "$wt_path" ]]; then
+    if [[ ! -e "$wt_path" ]]; then
         echo "${DIM}Directory does not exist — pruning stale entry.${NC}"
         printf '%s%s%s' "${BOLD}Prune " "$short_path" "? [y/N] ${NC}"
         read -r confirm
@@ -846,6 +846,11 @@ action_delete() {
             echo "Cancelled."
         fi
         return
+    fi
+
+    if [[ ! -d "$wt_path" ]]; then
+        echo "${RED}Path exists but is not a directory:${NC} $short_path"
+        return 1
     fi
 
     # ── Safety: can't remove the main worktree ────────────────────────
