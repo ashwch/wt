@@ -23,8 +23,6 @@ set -euo pipefail
 # =============================================================================
 
 readonly VERSION="0.1.0"
-SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_NAME
 
 # Resolve absolute path to this script for fzf callbacks
 _resolve_self() {
@@ -37,7 +35,8 @@ _resolve_self() {
     done
     echo "$(cd -P "$(dirname "$source")" && pwd)/$(basename "$source")"
 }
-readonly SELF="$(_resolve_self)"
+SELF="$(_resolve_self)"
+readonly SELF
 
 # Colors
 readonly RED=$'\033[31m'
@@ -61,18 +60,197 @@ warn() {
     echo "${YELLOW}warning:${NC} $*" >&2
 }
 
+# A stale worktree cannot prune itself because its directory is already gone.
+# We need any surviving checkout from the SAME repo whose worktree metadata
+# still contains the missing path.
+worktree_known_to_git_context() {
+    local git_ctx="$1" wt_path="$2"
+    git -C "$git_ctx" rev-parse --git-dir >/dev/null 2>&1 || return 1
+    git -C "$git_ctx" worktree list --porcelain 2>/dev/null \
+        | grep -qxF "worktree $wt_path"
+}
+
+# Prefer the explicit repo context passed from the dashboard. That matters when
+# the missing worktree lives far away from its siblings, so scanning the parent
+# directory would never find a checkout from the right repo.
+find_prune_context() {
+    local wt_path="$1" preferred_ctx="${2:-}"
+
+    if [[ -n "$preferred_ctx" ]] && worktree_known_to_git_context "$preferred_ctx" "$wt_path"; then
+        echo "$preferred_ctx"
+        return 0
+    fi
+
+    local parent_dir sibling
+    parent_dir=$(dirname "$wt_path")
+    for sibling in "$parent_dir"/*/; do
+        sibling="${sibling%/}"
+        [[ -d "$sibling" ]] || continue
+        if worktree_known_to_git_context "$sibling" "$wt_path"; then
+            echo "$sibling"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Prune immediately. In this flow the user just deleted or selected this exact
+# worktree, so waiting for Git's normal prune expiry is confusing.
+prune_worktree_metadata() {
+    local wt_path="$1" preferred_ctx="${2:-}"
+    local git_ctx=""
+
+    git_ctx=$(find_prune_context "$wt_path" "$preferred_ctx") || return 1
+    git -C "$git_ctx" worktree prune --expire now >/dev/null 2>&1
+}
+
+# A clean worktree can become dirty between the first confirmation screen and
+# the actual delete call. If Git refuses a normal remove at that point, re-check
+# the worktree and require an explicit force-delete confirmation.
+confirm_force_delete() {
+    local wt_path="$1"
+    local status_output="" dirty_count=0 line confirm
+
+    status_output=$(git -C "$wt_path" status --porcelain 2>/dev/null) || true
+    if [[ -n "$status_output" ]]; then
+        dirty_count=$(wc -l <<< "$status_output" | tr -d ' ')
+    fi
+
+    if (( dirty_count == 0 )); then
+        return 0
+    fi
+
+    echo ""
+    echo "${YELLOW}Worktree now has $dirty_count uncommitted change(s):${NC}"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && echo "  ${DIM}$line${NC}"
+    done < <(head -10 <<< "$status_output")
+    (( dirty_count > 10 )) && echo "  ${DIM}… and $((dirty_count - 10)) more${NC}"
+
+    echo ""
+    echo "${RED}${BOLD}Filesystem cleanup would permanently delete those changes.${NC}"
+    printf '%s' "${BOLD}Type 'delete' to force removal: ${NC}"
+    read -r confirm
+    [[ "$confirm" == "delete" ]]
+}
+
+# "Permission denied" from rm -rf usually means the remaining path is blocked by
+# directory permissions, ACLs, or macOS immutable flags. Fix the blockers first,
+# then let the next delete attempt remove the tree normally.
+#
+# Only touch paths INSIDE the worktree itself. Symlinks are skipped so we never
+# mutate a target outside the worktree by accident.
+repair_delete_barriers() {
+    local wt_path="$1" entry
+
+    for _attempt in 1 2 3; do
+        [[ -e "$wt_path" ]] || return 0
+
+        chmod u+rwx "$wt_path" 2>/dev/null || true
+        chmod -N "$wt_path" 2>/dev/null || true
+
+        while IFS= read -r entry; do
+            [[ -n "$entry" ]] || continue
+
+            # rm -rf often gets stuck on unreadable directories. Walk
+            # directories in pre-order so we can fix the next blocked node
+            # before the subsequent delete retry.
+            [[ -L "$entry" ]] && continue
+            chmod u+rwx "$entry" 2>/dev/null || true
+            chmod -N "$entry" 2>/dev/null || true
+        done < <(find "$wt_path" -type d -print 2>/dev/null || true)
+
+        while IFS= read -r entry; do
+            [[ -n "$entry" ]] || continue
+            [[ -L "$entry" ]] && continue
+            chmod -N "$entry" 2>/dev/null || true
+            if command -v chflags >/dev/null 2>&1; then
+                chflags nouchg,noschg "$entry" 2>/dev/null || true
+            fi
+        done < <(find "$wt_path" -print 2>/dev/null || true)
+    done
+}
+
+# Git and the filesystem can diverge here: `git worktree remove` may succeed in
+# removing metadata but leave unreadable directories behind, or it may fail
+# after partially deleting the tree. This helper finishes the filesystem side
+# and prints concrete diagnostics if the path still cannot be removed.
+delete_worktree_path() {
+    local wt_path="$1"
+    local remove_output="" rm_output
+
+    for _attempt in 1 2 3; do
+        [[ -e "$wt_path" ]] || return 0
+
+        if rm_output=$(rm -rf "$wt_path" 2>&1); then
+            [[ -n "$rm_output" ]] && remove_output+="$rm_output"$'\n'
+        else
+            [[ -n "$rm_output" ]] && remove_output+="$rm_output"$'\n'
+        fi
+
+        [[ ! -e "$wt_path" ]] && return 0
+
+        repair_delete_barriers "$wt_path"
+
+        if [[ -d "$wt_path" ]] && [[ -z "$(find "$wt_path" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+            rmdir "$wt_path" 2>/dev/null || true
+        fi
+
+        [[ ! -e "$wt_path" ]] && return 0
+    done
+
+    if [[ -n "$remove_output" ]]; then
+        printf '%s' "$remove_output" | sed '/^$/d' | sed 's/^/  /'
+    fi
+
+    echo "${RED}Directory still exists after multiple cleanup attempts.${NC}"
+
+    local current_user entry shown owner_mismatch
+    current_user=$(id -un)
+
+    shown=0
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        if (( shown == 0 )); then
+            echo "${DIM}Remaining entries:${NC}"
+        fi
+        printf '  %s\n' "$(shorten_path "$entry")"
+        shown=$(( shown + 1 ))
+        (( shown >= 10 )) && break
+    done < <(find "$wt_path" -mindepth 1 -maxdepth 2 -print 2>/dev/null || true)
+
+    owner_mismatch=$(find "$wt_path" ! -user "$current_user" -print -quit 2>/dev/null || true)
+    if [[ -n "$owner_mismatch" ]]; then
+        echo "${DIM}Some remaining entries are not owned by $current_user.${NC}"
+    fi
+
+    echo "${DIM}Inspect with: ls -ldOe \"$wt_path\" \"$wt_path\"/*${NC}"
+    return 1
+}
+
 canonical_path() {
     # Resolve symlinks without GNU realpath (unavailable on older macOS).
-    # Handles /tmp → /private/tmp symlink that breaks path comparisons.
-    if [[ -d "$1" ]]; then
-        (cd -P "$1" 2>/dev/null && pwd) || echo "$1"
-    elif [[ -e "$1" ]]; then
+    # Handles /tmp → /private/tmp style symlinks that break path comparisons.
+    # Missing paths still need canonicalization too, because Git may remember a
+    # deleted worktree as /private/... while the user selected /var/...
+    local path="$1"
+    if [[ -d "$path" ]]; then
+        (cd -P "$path" 2>/dev/null && pwd) || echo "$path"
+    elif [[ -e "$path" ]]; then
         local dir base
-        dir=$(cd -P "$(dirname "$1")" 2>/dev/null && pwd) || { echo "$1"; return; }
-        base=$(basename "$1")
+        dir=$(cd -P "$(dirname "$path")" 2>/dev/null && pwd) || { echo "$path"; return; }
+        base=$(basename "$path")
         echo "$dir/$base"
     else
-        echo "$1"
+        local parent base
+        parent=$(dirname "$path")
+        base=$(basename "$path")
+        if parent=$(cd -P "$parent" 2>/dev/null && pwd); then
+            echo "$parent/$base"
+        else
+            echo "$path"
+        fi
     fi
 }
 
@@ -588,7 +766,7 @@ cmd_preview() {
     done < <(git -C "$wt_path" status --porcelain 2>/dev/null)
 
     if (( modified + untracked + staged == 0 )); then
-        printf "  ${GREEN}Clean${NC}\n"
+        printf '  %s\n' "${GREEN}Clean${NC}"
     else
         local summary=""
         (( staged > 0 )) && summary+="${GREEN}$staged staged${NC}"
@@ -619,7 +797,7 @@ action_new() {
     local base
     base=$(dirname "$wt_path")
 
-    printf "${BOLD}New branch name: ${NC}"
+    printf '%s' "${BOLD}New branch name: ${NC}"
     local branch
     read -r branch
 
@@ -637,35 +815,20 @@ action_new() {
 action_delete() {
     local wt_path
     wt_path=$(canonical_path "$1")
+    # When invoked from the dashboard, arg 2 is the repo context that launched
+    # wt. We use it for stale-entry pruning, because the missing worktree itself
+    # may no longer provide a usable Git context.
+    local preferred_ctx="${2:-}"
     local short_path
     short_path=$(shorten_path "$wt_path")
 
     # ── Prunable (directory already gone) ─────────────────────────────
     if [[ ! -d "$wt_path" ]]; then
         echo "${DIM}Directory does not exist — pruning stale entry.${NC}"
-        printf "${BOLD}Prune %s? [y/N] ${NC}" "$short_path"
+        printf '%s%s%s' "${BOLD}Prune " "$short_path" "? [y/N] ${NC}"
         read -r confirm
         if [[ "$confirm" =~ ^[yY]$ ]]; then
-            # Find a sibling worktree FROM THE SAME REPO to run prune from.
-            # The parent dir isn't a git repo, so we scan siblings. We verify
-            # the stale path appears in the candidate's worktree list — without
-            # this, a sibling from a different repo would silently no-op prune.
-            local sibling="" parent_dir candidate
-            parent_dir=$(dirname "$wt_path")
-            for candidate in "$parent_dir"/*/; do
-                candidate="${candidate%/}"
-                [[ -d "$candidate" ]] || continue
-                git -C "$candidate" rev-parse --git-dir >/dev/null 2>&1 || continue
-                # Verify this checkout knows about the stale worktree
-                if git -C "$candidate" worktree list --porcelain 2>/dev/null \
-                        | grep -qxF "worktree $wt_path"; then
-                    sibling="$candidate"
-                    break
-                fi
-            done
-
-            if [[ -n "$sibling" ]]; then
-                git -C "$sibling" worktree prune 2>&1
+            if prune_worktree_metadata "$wt_path" "$preferred_ctx"; then
                 echo "${GREEN}✓${NC} Pruned"
             else
                 echo "${RED}Could not find a valid git context to prune from.${NC}"
@@ -754,10 +917,28 @@ action_delete() {
 
         echo ""
         echo "${RED}${BOLD}This will permanently delete uncommitted work.${NC}"
-        printf "${BOLD}Type 'delete' to confirm: ${NC}"
+        printf '%s' "${BOLD}Type 'delete' to confirm: ${NC}"
         read -r confirm
         if [[ "$confirm" == "delete" ]]; then
-            git -C "$main_wt" worktree remove --force "$wt_path" 2>&1
+            if git -C "$main_wt" worktree remove --force "$wt_path" 2>&1; then
+                if [[ -e "$wt_path" ]]; then
+                    # Metadata removal succeeded, but the filesystem still has
+                    # leftovers. Finish the local cleanup.
+                    delete_worktree_path "$wt_path" || true
+                fi
+            else
+                # Force delete was already explicitly confirmed above, so it is
+                # safe to fall back to direct filesystem cleanup here.
+                warn "git worktree remove --force failed; retrying filesystem cleanup"
+                delete_worktree_path "$wt_path" || true
+                prune_worktree_metadata "$wt_path" "$main_wt" || true
+            fi
+
+            if [[ -e "$wt_path" ]]; then
+                return 1
+            fi
+
+            prune_worktree_metadata "$wt_path" "$main_wt" || true
             echo "${GREEN}✓${NC} Removed"
         else
             echo "Cancelled."
@@ -775,10 +956,31 @@ action_delete() {
         echo "${DIM}Working tree is clean. Branch '$branch_name' will be preserved.${NC}"
     fi
 
-    printf "${BOLD}Remove? [y/N] ${NC}"
+    printf '%s' "${BOLD}Remove? [y/N] ${NC}"
     read -r confirm
     if [[ "$confirm" =~ ^[yY]$ ]]; then
-        git -C "$main_wt" worktree remove "$wt_path" 2>&1
+        if git -C "$main_wt" worktree remove "$wt_path" 2>&1; then
+            if [[ -e "$wt_path" ]]; then
+                delete_worktree_path "$wt_path" || true
+            fi
+        else
+            # For a previously clean worktree, do NOT jump straight to rm -rf.
+            # Re-check first: new files may have appeared since the first
+            # prompt, and those deserve a stronger confirmation.
+            if ! confirm_force_delete "$wt_path"; then
+                echo "Cancelled."
+                return
+            fi
+            warn "git worktree remove failed; forcing filesystem cleanup"
+            delete_worktree_path "$wt_path" || true
+            prune_worktree_metadata "$wt_path" "$main_wt" || true
+        fi
+
+        if [[ -e "$wt_path" ]]; then
+            return 1
+        fi
+
+        prune_worktree_metadata "$wt_path" "$main_wt" || true
         echo "${GREEN}✓${NC} Removed"
     else
         echo "Cancelled."
@@ -848,9 +1050,11 @@ launch_fzf() {
     self_q=$(printf '%q' "$SELF")
 
     local list_cmd="$self_q --list"
+    local delete_cmd="$self_q --action-delete {1}"
     if [[ -n "${REPO_PATH:-}" ]]; then
         repo_q=$(printf '%q' "$REPO_PATH")
         list_cmd="$list_cmd $repo_q"
+        delete_cmd="$delete_cmd $repo_q"
     fi
 
     # Parse worktrees to compute common prefix for the header
@@ -895,7 +1099,7 @@ launch_fzf() {
         --bind="ctrl-p:execute(git -C {1} pull --ff-only)+reload($list_cmd)" \
         --bind="ctrl-r:reload($list_cmd)" \
         --bind="ctrl-n:execute($self_q --action-new {1} </dev/tty >/dev/tty 2>&1)+reload($list_cmd)" \
-        --bind="ctrl-x:execute($self_q --action-delete {1} </dev/tty >/dev/tty 2>&1)+reload($list_cmd)" \
+        --bind="ctrl-x:execute($delete_cmd </dev/tty >/dev/tty 2>&1)+reload($list_cmd)" \
         --bind="ctrl-/:toggle-preview" \
         --pointer="▶" \
         --prompt="worktree▶ " \
@@ -937,7 +1141,7 @@ main() {
             return 0
             ;;
         --action-delete)
-            action_delete "${2:?Missing worktree path for --action-delete}"
+            action_delete "${2:?Missing worktree path for --action-delete}" "${3:-}"
             return 0
             ;;
         -*)
