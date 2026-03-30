@@ -110,26 +110,34 @@ prune_worktree_metadata() {
 # the worktree and require an explicit force-delete confirmation.
 confirm_force_delete() {
     local wt_path="$1"
-    local status_output="" dirty_count=0 line confirm
+    local status_output="" dirty_count=0 line confirm status_exit=0 status_unknown=0
 
-    status_output=$(git -C "$wt_path" status --porcelain 2>/dev/null) || true
+    status_output=$(git -C "$wt_path" status --porcelain 2>/dev/null) || status_exit=$?
     if [[ -n "$status_output" ]]; then
         dirty_count=$(wc -l <<< "$status_output" | tr -d ' ')
+    elif (( status_exit != 0 )); then
+        status_unknown=1
     fi
 
-    if (( dirty_count == 0 )); then
+    if (( dirty_count == 0 )) && (( status_unknown == 0 )); then
         return 0
     fi
 
     echo ""
-    echo "${YELLOW}Worktree now has $dirty_count uncommitted change(s):${NC}"
-    while IFS= read -r line; do
-        [[ -n "$line" ]] && echo "  ${DIM}$line${NC}"
-    done < <(head -10 <<< "$status_output")
-    (( dirty_count > 10 )) && echo "  ${DIM}… and $((dirty_count - 10)) more${NC}"
+    if (( status_unknown != 0 )); then
+        echo "${YELLOW}Warning:${NC} Unable to determine Git status for this worktree."
+        echo "${RED}${BOLD}Filesystem cleanup may permanently delete untracked or uncommitted changes.${NC}"
+    else
+        echo "${YELLOW}Worktree now has $dirty_count uncommitted change(s):${NC}"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && echo "  ${DIM}$line${NC}"
+        done < <(head -10 <<< "$status_output")
+        (( dirty_count > 10 )) && echo "  ${DIM}… and $((dirty_count - 10)) more${NC}"
 
-    echo ""
-    echo "${RED}${BOLD}Filesystem cleanup would permanently delete those changes.${NC}"
+        echo ""
+        echo "${RED}${BOLD}Filesystem cleanup would permanently delete those changes.${NC}"
+    fi
+
     printf '%s' "${BOLD}Type 'delete' to force removal: ${NC}"
     read -r confirm
     [[ "$confirm" == "delete" ]]
@@ -142,7 +150,7 @@ confirm_force_delete() {
 # Only touch paths INSIDE the worktree itself. Symlinks are skipped so we never
 # mutate a target outside the worktree by accident.
 repair_delete_barriers() {
-    local wt_path="$1" entry
+    local wt_path="$1" entry _attempt
 
     for _attempt in 1 2 3; do
         [[ -e "$wt_path" ]] || return 0
@@ -177,7 +185,7 @@ repair_delete_barriers() {
 # after partially deleting the tree. This helper finishes the filesystem side
 # and prints concrete diagnostics if the path still cannot be removed.
 delete_worktree_path() {
-    local wt_path="$1"
+    local wt_path="$1" _attempt
     local remove_output="" rm_output
 
     for _attempt in 1 2 3; do
@@ -1044,8 +1052,9 @@ launch_fzf() {
 
     local editor="${EDITOR:-vim}"
 
-    # Shell-escape paths for safe embedding in fzf command strings.
-    # printf '%q' produces a bash-quoted string that survives eval.
+    # Shell-escape script/repo paths for safe embedding in fzf command strings.
+    # fzf placeholder fields like {1} are already substituted as shell-quoted
+    # strings, so we keep those raw and only quote the static path pieces here.
     local self_q repo_q
     self_q=$(printf '%q' "$SELF")
 

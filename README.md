@@ -79,8 +79,10 @@ leave behind a stale path.
 - Dirty worktree:
   `Ctrl-X` shows the first few changes and requires typing `delete`.
 - If Git leaves unreadable leftovers behind:
-  `wt` retries removal, repairs directory permissions, clears ACLs, clears
-  macOS immutable flags when available, and tries again.
+  `wt` re-checks whether force cleanup is still safe. If status is known, it
+  can continue; if status can no longer be verified, it fails closed and asks
+  you to type `delete` before repairing permissions, clearing ACLs, clearing
+  macOS immutable flags when available, and retrying removal.
 - If the directory is already gone:
   `wt` offers to prune the stale worktree entry from Git metadata.
 
