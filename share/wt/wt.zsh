@@ -48,13 +48,13 @@ if _WT_WRAPPER_EXECUTABLE="$(_wt_find_executable)"; then
         # Keep failures loud and truthful. If the underlying command failed, do
         # not hide that behind wrapper sugar like `cd`.
         if (( exit_code != 0 )); then
-            [[ -n "$result" ]] && echo "$result"
+            [[ -n "$result" ]] && printf '%s\n' "$result"
             return "$exit_code"
         fi
         if [[ -d "$result" ]]; then
             cd "$result" || return
         elif [[ -n "$result" ]]; then
-            echo "$result"
+            printf '%s\n' "$result"
         fi
     }
 fi

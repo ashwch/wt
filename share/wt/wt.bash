@@ -45,13 +45,13 @@ if _WT_WRAPPER_EXECUTABLE="$(_wt_find_executable)"; then
         # Preserve the real exit status. The wrapper only adds "cd into the
         # chosen directory" behavior; it should never make failures ambiguous.
         if (( exit_code != 0 )); then
-            [[ -n "$result" ]] && echo "$result"
+            [[ -n "$result" ]] && printf '%s\n' "$result"
             return "$exit_code"
         fi
         if [[ -d "$result" ]]; then
             cd "$result" || return
         elif [[ -n "$result" ]]; then
-            echo "$result"
+            printf '%s\n' "$result"
         fi
     }
 fi

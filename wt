@@ -155,14 +155,13 @@ require_command() {
 # still contains the missing path.
 worktree_known_to_git_context() {
     local git_ctx="$1" wt_path="$2"
-    git -C "$git_ctx" rev-parse --git-dir >/dev/null 2>&1 || return 1
-    git -C "$git_ctx" worktree list --porcelain 2>/dev/null \
-        | grep -qxF "worktree $wt_path"
+    worktree_state_from_context "$git_ctx" "$wt_path" >/dev/null 2>&1
 }
 
 worktree_state_from_context() {
     local git_ctx="$1" wt_path="$2"
     git -C "$git_ctx" rev-parse --git-dir >/dev/null 2>&1 || return 1
+    wt_path=$(canonical_path "$wt_path")
 
     # We only need one worktree's state, but Git gives us the whole porcelain
     # stream. Walk the records once and return the state for the matching path.
@@ -185,7 +184,7 @@ worktree_state_from_context() {
         fi
 
         case "$line" in
-            worktree\ *) current_path="${line#worktree }" ;;
+            worktree\ *) current_path=$(canonical_path "${line#worktree }") ;;
             detached)    state="detached" ;;
             prunable*)   state="prunable" ;;
             locked*)     locked="yes" ;;
@@ -998,8 +997,9 @@ start_async_refresh() {
     local socket_path="${1:?Missing fzf socket path}"
     local output_path="${2:?Missing activity output path}"
     local token_file="${3:?Missing refresh token file}"
-    local repo_path="${4:-}"
-    local token
+    local pid_file="${4:?Missing refresh pid file}"
+    local repo_path="${5:-}"
+    local token old_pid=""
 
     command -v curl >/dev/null 2>&1 || return 0
 
@@ -1008,13 +1008,24 @@ start_async_refresh() {
     # slower refresh from overwriting a newer one.
     token="$(date +%s)-$$-$RANDOM-$RANDOM"
     printf '%s' "$token" > "$token_file"
+    if [[ -f "$pid_file" ]]; then
+        old_pid=$(cat "$pid_file" 2>/dev/null || true)
+        if [[ "$old_pid" =~ ^[0-9]+$ ]] && (( old_pid != $$ )) && kill -0 "$old_pid" 2>/dev/null; then
+            kill "$old_pid" >/dev/null 2>&1 || true
+        fi
+    fi
+    printf '%s' "$$" > "$pid_file"
+    trap 'if [[ -f "$pid_file" ]] && [[ "$(cat "$pid_file" 2>/dev/null)" == "$$" ]]; then rm -f "$pid_file"; fi' EXIT
 
     if [[ -n "${WT_CAN_CHANGE_LIST_LABEL:-}" ]]; then
         post_fzf_action "$socket_path" "change-list-label(worktrees · loading activity...)" || true
     fi
 
+    # Run the refresh worker in this process. Callers decide whether this
+    # launcher should run in the background, which keeps the tracked PID tied to
+    # the real worker rather than a short-lived intermediate shell.
     "$SELF" --action-async-refresh "$socket_path" "$output_path" "$token_file" "$token" "$repo_path" \
-        >/dev/null 2>&1 &
+        >/dev/null 2>&1
 }
 
 # Build the expensive "latest activity" list off the critical startup path,
@@ -1622,8 +1633,8 @@ launch_fzf() {
     preview_window=$(choose_preview_window)
     local fzf_help
     local supports_listen=false supports_list_label=false
-    local session_dir="" socket_path="" activity_file="" token_file=""
-    local async_refresh_cmd="" async_pid=""
+    local session_dir="" socket_path="" activity_file="" token_file="" pid_file=""
+    local async_refresh_cmd="" async_refresh_bind="" async_pid=""
     local -a listen_args=() track_args=() list_label_args=()
     local list_label="worktrees · branch/state"
 
@@ -1662,13 +1673,15 @@ launch_fzf() {
             socket_path="$session_dir/fzf.sock"
             activity_file="$session_dir/activity.list"
             token_file="$session_dir/refresh.token"
+            pid_file="$session_dir/refresh.pid"
             # These values are injected into fzf execute/reload strings, so
             # quote them once up front instead of hoping the temp directory has
             # no spaces or special shell characters.
-            local socket_q activity_q token_q
+            local socket_q activity_q token_q pid_q
             socket_q=$(printf '%q' "$socket_path")
             activity_q=$(printf '%q' "$activity_file")
             token_q=$(printf '%q' "$token_file")
+            pid_q=$(printf '%q' "$pid_file")
             listen_args+=("--listen=$socket_path")
             track_args+=("--track")
             if $supports_list_label; then
@@ -1677,10 +1690,11 @@ launch_fzf() {
             else
                 async_refresh_cmd=""
             fi
-            async_refresh_cmd+="$self_q --action-start-async-refresh $socket_q $activity_q $token_q"
+            async_refresh_cmd+="$self_q --action-start-async-refresh $socket_q $activity_q $token_q $pid_q"
             if [[ -n "${REPO_PATH:-}" ]]; then
                 async_refresh_cmd="$async_refresh_cmd $repo_q"
             fi
+            async_refresh_bind="+execute-silent($async_refresh_cmd >/dev/null 2>&1 &)"
         fi
     fi
     if $supports_list_label; then
@@ -1711,10 +1725,10 @@ launch_fzf() {
 
     if [[ -n "$async_refresh_cmd" ]]; then
         if $supports_list_label; then
-            WT_CAN_CHANGE_LIST_LABEL=1 "$SELF" --action-start-async-refresh "$socket_path" "$activity_file" "$token_file" "${REPO_PATH:-}" \
+            WT_CAN_CHANGE_LIST_LABEL=1 "$SELF" --action-start-async-refresh "$socket_path" "$activity_file" "$token_file" "$pid_file" "${REPO_PATH:-}" \
                 >/dev/null 2>&1 &
         else
-            "$SELF" --action-start-async-refresh "$socket_path" "$activity_file" "$token_file" "${REPO_PATH:-}" \
+            "$SELF" --action-start-async-refresh "$socket_path" "$activity_file" "$token_file" "$pid_file" "${REPO_PATH:-}" \
                 >/dev/null 2>&1 &
         fi
         async_pid=$!
@@ -1741,10 +1755,10 @@ launch_fzf() {
         --no-multi \
         --bind="enter:become(echo {1})" \
         --bind="ctrl-o:execute($editor {1})" \
-        --bind="ctrl-p:execute(git -C {1} pull --ff-only)+reload($list_cmd)${async_refresh_cmd:+}+execute-silent($async_refresh_cmd >/dev/null 2>&1 &)" \
-        --bind="ctrl-r:reload($list_cmd)${async_refresh_cmd:+}+execute-silent($async_refresh_cmd >/dev/null 2>&1 &)" \
-        --bind="ctrl-n:execute($self_q --action-new {1} </dev/tty >/dev/tty 2>&1)+reload($list_cmd)${async_refresh_cmd:+}+execute-silent($async_refresh_cmd >/dev/null 2>&1 &)" \
-        --bind="ctrl-x:execute($delete_cmd </dev/tty >/dev/tty 2>&1)+reload($list_cmd)${async_refresh_cmd:+}+execute-silent($async_refresh_cmd >/dev/null 2>&1 &)" \
+        --bind="ctrl-p:execute(git -C {1} pull --ff-only)+reload($list_cmd)${async_refresh_bind}" \
+        --bind="ctrl-r:reload($list_cmd)${async_refresh_bind}" \
+        --bind="ctrl-n:execute($self_q --action-new {1} </dev/tty >/dev/tty 2>&1)+reload($list_cmd)${async_refresh_bind}" \
+        --bind="ctrl-x:execute($delete_cmd </dev/tty >/dev/tty 2>&1)+reload($list_cmd)${async_refresh_bind}" \
         --bind="ctrl-/:toggle-preview" \
         --pointer="▶" \
         --prompt="worktree▶ " \
@@ -1753,13 +1767,21 @@ launch_fzf() {
     if [[ -n "$async_pid" ]]; then
         kill "$async_pid" >/dev/null 2>&1 || true
     fi
+    if [[ -f "$pid_file" ]]; then
+        local refresh_pid
+        refresh_pid=$(cat "$pid_file" 2>/dev/null || true)
+        if [[ "$refresh_pid" =~ ^[0-9]+$ ]] && kill -0 "$refresh_pid" 2>/dev/null; then
+            kill "$refresh_pid" >/dev/null 2>&1 || true
+        fi
+        rm -f "$pid_file"
+    fi
     if [[ -n "$session_dir" ]]; then
         rm -rf "$session_dir"
     fi
 
     # Output result (path for cd wrapper, or empty on escape)
     if [[ -n "$result" ]]; then
-        echo "$result"
+        printf '%s\n' "$result"
     fi
 }
 
@@ -1802,7 +1824,7 @@ main() {
             return 0
             ;;
         --action-start-async-refresh)
-            start_async_refresh "${2:?Missing fzf socket path}" "${3:?Missing activity output path}" "${4:?Missing refresh token file}" "${5:-}"
+            start_async_refresh "${2:?Missing fzf socket path}" "${3:?Missing activity output path}" "${4:?Missing refresh token file}" "${5:?Missing refresh pid file}" "${6:-}"
             return 0
             ;;
         --action-async-refresh)
