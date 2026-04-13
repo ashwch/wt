@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-13
+
+### Added
+- Added first-class Bash shell integration via `share/wt/wt.bash`
+- Added a dedicated workflow security audit using `pinact` and `zizmor`
+- Added WSL smoke-test coverage in CI
+
+### Changed
+- Split dashboard loading into a fast startup list plus lazy latest-activity refresh
+- Made preview placement and row formatting responsive to terminal and pane width
+- Tightened release publishing to use pinned actions, narrower permissions, and `gh release create`
+- Expanded the README with dependency, platform, layout, stale-worktree, and workflow-security guidance
+
+### Fixed
+- Hardened stale and prunable worktree detection across canonicalized and symlinked paths
+- Prevented async refresh worker leaks and invalid fallback binds on older `fzf` builds
+- Preserved exact wrapper passthrough output across Bash and zsh integrations
+- Normalized shell and workflow files to LF so WSL execution stays reliable from Windows checkouts
+
 ## [0.1.1] - 2026-03-30
 
 ### Fixed
