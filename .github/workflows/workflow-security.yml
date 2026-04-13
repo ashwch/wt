@@ -1,0 +1,81 @@
+#
+# yamllint disable rule:truthy
+#
+# Workflow Security
+# -----------------
+# Treat workflow files as executable infrastructure and keep their security
+# checks in CI rather than as an occasional manual audit.
+#
+# This workflow runs:
+# 1. pinact  - verifies actions are pinned to immutable SHAs
+# 2. zizmor  - audits workflow files for common Actions-specific risks
+#
+# Local equivalents if the tools are on PATH:
+#   GITHUB_TOKEN="$(gh auth token)" pinact run --check --verify --diff
+#   zizmor --persona regular .github/workflows .github/actions
+#
+name: Workflow Security
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: workflow-security-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  workflow-security:
+    name: Workflow Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify action pinning
+        uses: suzuki-shunsuke/pinact-action@28aeb220eb3252ad0d4422dd5d9368e925acbd8d # v1.3.0
+        with:
+          github_token: ${{ github.token }}
+          skip_push: "true"
+          verify: "true"
+
+      - name: Collect zizmor inputs
+        id: collect-inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          inputs=".github/workflows"
+          if [[ -d ".github/actions" ]]; then
+            inputs="${inputs}"$'\n'".github/actions"
+          fi
+          echo "inputs<<EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$inputs" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@71321a20a9ded102f6e9ce5718a2fcec2c4f70d8 # v0.5.2
+        with:
+          advanced-security: false
+          annotations: true
+          fail-on-no-inputs: false
+          inputs: ${{ steps.collect-inputs.outputs.inputs }}
+          persona: regular

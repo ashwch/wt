@@ -1,3 +1,16 @@
+#
+# Release
+# -------
+# Keep the release path narrow and readable:
+# - checkout the tagged commit
+# - build the archive locally
+# - publish the release with the GitHub CLI already on the runner
+#
+# Why use `gh release create` instead of another release action:
+# - fewer third-party moving parts in the write path
+# - easier to reproduce manually
+# - simpler security review
+#
 name: Release
 
 on:
@@ -5,26 +18,35 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Get version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Create release archive
+        id: archive
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          prefix="wt-${{ steps.version.outputs.version }}"
-          git archive --format=tar.gz --prefix="$prefix/" HEAD -o "$prefix.tar.gz"
+          set -euo pipefail
+          version="${REF_NAME#v}"
+          prefix="wt-${version}"
+          archive="${prefix}.tar.gz"
+          git archive --format=tar.gz --prefix="${prefix}/" HEAD -o "$archive"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: wt-${{ steps.version.outputs.version }}.tar.gz
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          ARCHIVE: ${{ steps.archive.outputs.archive }}
+        run: |
+          set -euo pipefail
+          gh release create "${REF_NAME}" --generate-notes "${ARCHIVE}"
