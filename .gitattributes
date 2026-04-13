@@ -1,0 +1,14 @@
+* text=auto
+
+# Shell and workflow files must stay LF so they run correctly from WSL and
+# other Unix environments even when the repo is checked out on Windows.
+wt text eol=lf
+*.bash text eol=lf
+*.zsh text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Keep repository docs stable across platforms as well.
+*.md text eol=lf
+LICENSE text eol=lf
