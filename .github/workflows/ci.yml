@@ -58,24 +58,24 @@ jobs:
         include:
           - name: ubuntu-22.04
             runner: ubuntu-22.04
-            install_fzf: sudo apt-get update && sudo apt-get install -y fzf
+            install_deps: sudo apt-get update && sudo apt-get install -y fzf zsh
           - name: ubuntu-24.04
             runner: ubuntu-24.04
-            install_fzf: sudo apt-get update && sudo apt-get install -y fzf
+            install_deps: sudo apt-get update && sudo apt-get install -y fzf zsh
           - name: macos-14
             runner: macos-14
-            install_fzf: brew install fzf
+            install_deps: brew install fzf
           - name: macos-15
             runner: macos-15
-            install_fzf: brew install fzf
+            install_deps: brew install fzf
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
 
-      - name: Install fzf
-        run: ${{ matrix.install_fzf }}
+      - name: Install test dependencies
+        run: ${{ matrix.install_deps }}
 
       - name: Verify --version
         run: |
@@ -146,7 +146,7 @@ jobs:
 
           # windows runners expose GITHUB_WORKSPACE as a Windows path. Convert
           # it only when necessary so the same script still reads naturally.
-          workspace="$GITHUB_WORKSPACE"
+          workspace="${GITHUB_WORKSPACE:-${{ github.workspace }}}"
           case "$workspace" in
             [A-Za-z]:\\*)
               workspace=$(wslpath "$workspace")
