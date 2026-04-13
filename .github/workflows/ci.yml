@@ -1,3 +1,15 @@
+#
+# CI
+# --
+# This workflow proves two things:
+# 1. the shell code still parses and lints cleanly
+# 2. the supported Unix environments still run the basic entrypoints
+#
+# First principles:
+# - A shell tool can claim "macOS / Linux / WSL" support very cheaply.
+# - Proving that claim needs an explicit matrix.
+# - Checkout should stay read-only in CI unless a job truly needs write access.
+#
 name: CI
 
 on:
@@ -6,11 +18,16 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
@@ -21,27 +38,44 @@ jobs:
       - name: ShellCheck zsh integration
         run: shellcheck -S error -e SC1091 share/wt/wt.zsh
 
+      - name: ShellCheck bash integration
+        run: shellcheck -S error share/wt/wt.bash
+
       - name: Bash syntax check
         run: bash -n wt
+
+      - name: Bash wrapper syntax check
+        run: bash -n share/wt/wt.bash
 
       - name: Zsh syntax check
         run: zsh -n share/wt/wt.zsh
 
   test:
+    name: Smoke test (${{ matrix.name }})
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - name: ubuntu-22.04
+            runner: ubuntu-22.04
+            install_fzf: sudo apt-get update && sudo apt-get install -y fzf
+          - name: ubuntu-24.04
+            runner: ubuntu-24.04
+            install_fzf: sudo apt-get update && sudo apt-get install -y fzf
+          - name: macos-14
+            runner: macos-14
+            install_fzf: brew install fzf
+          - name: macos-15
+            runner: macos-15
+            install_fzf: brew install fzf
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Install fzf
-        run: |
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            sudo apt-get update && sudo apt-get install -y fzf
-          else
-            brew install fzf
-          fi
+        run: ${{ matrix.install_fzf }}
 
       - name: Verify --version
         run: |
@@ -55,6 +89,18 @@ jobs:
           echo "$output"
           echo "$output" | grep -q "USAGE" || { echo "Missing USAGE in help"; exit 1; }
 
+      - name: Verify bash wrapper runtime
+        run: |
+          output=$(env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc -c 'source share/wt/wt.bash; wt --version')
+          echo "$output"
+          [[ "$output" == "wt 0."* ]] || { echo "Unexpected bash wrapper output"; exit 1; }
+
+      - name: Verify zsh wrapper runtime
+        run: |
+          output=$(env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin zsh -f -c 'source share/wt/wt.zsh; wt --version')
+          echo "$output"
+          [[ "$output" == "wt 0."* ]] || { echo "Unexpected zsh wrapper output"; exit 1; }
+
       - name: Error outside git repo
         run: |
           cd /tmp
@@ -62,10 +108,86 @@ jobs:
           echo "$output"
           echo "$output" | grep -qi "not.*git" || { echo "Expected git error"; exit 1; }
 
+  wsl-test:
+    name: Smoke test (wsl-ubuntu-24.04)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install WSL and Ubuntu
+        uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7.0.0
+        with:
+          distribution: Ubuntu-24.04
+          update: 'true'
+          # Keep this workflow simple and deterministic. The job is a smoke
+          # test, not a package-cache benchmark.
+          use-cache: 'false'
+          additional-packages: >-
+            git
+            fzf
+            zsh
+            shellcheck
+
+      - name: Verify WSL environment
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          [[ -n "${WSL_DISTRO_NAME:-}" ]] || { echo "Not running inside WSL"; exit 1; }
+          git --version
+          fzf --version
+          bash --version
+
+      - name: Run WSL smoke tests
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+
+          # windows runners expose GITHUB_WORKSPACE as a Windows path. Convert
+          # it only when necessary so the same script still reads naturally.
+          workspace="$GITHUB_WORKSPACE"
+          case "$workspace" in
+            [A-Za-z]:\\*)
+              workspace=$(wslpath "$workspace")
+              ;;
+          esac
+
+          cd "$workspace"
+
+          bash -n wt
+          bash -n share/wt/wt.bash
+          zsh -n share/wt/wt.zsh
+          shellcheck -S error wt share/wt/wt.bash
+          shellcheck -S error -e SC1091 share/wt/wt.zsh
+
+          output=$(./wt --version)
+          echo "$output"
+          [[ "$output" == "wt 0."* ]] || { echo "Unexpected version output"; exit 1; }
+
+          output=$(./wt --help)
+          echo "$output"
+          echo "$output" | grep -q "USAGE" || { echo "Missing USAGE in help"; exit 1; }
+
+          output=$(env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc -c 'source share/wt/wt.bash; wt --version')
+          echo "$output"
+          [[ "$output" == "wt 0."* ]] || { echo "Unexpected bash wrapper output"; exit 1; }
+
+          output=$(env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin zsh -f -c 'source share/wt/wt.zsh; wt --version')
+          echo "$output"
+          [[ "$output" == "wt 0."* ]] || { echo "Unexpected zsh wrapper output"; exit 1; }
+
+          cd /tmp
+          output=$("$workspace/wt" 2>&1 || true)
+          echo "$output"
+          echo "$output" | grep -qi "not.*git" || { echo "Expected git error"; exit 1; }
+
   homebrew-test:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Audit formula
         run: |
@@ -76,7 +198,9 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Check version in CHANGELOG
         run: |

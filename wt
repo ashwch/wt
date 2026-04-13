@@ -60,6 +60,96 @@ warn() {
     echo "${YELLOW}warning:${NC} $*" >&2
 }
 
+# Turn a missing command into a concrete install command.
+#
+# First principles:
+# - "missing dependency" errors are only useful if they tell the user what to
+#   do next.
+# - `wt` is a small shell tool, so we keep the dependency story equally small:
+#   name the missing tool, name the job it was needed for, then show one
+#   install command that likely works on the current machine.
+install_hint_for() {
+    local cmd="$1"
+
+    case "$cmd" in
+        fzf)
+            if command -v brew >/dev/null 2>&1; then
+                echo "brew install fzf"
+            elif command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
+                echo "sudo apt install fzf"
+            elif command -v dnf >/dev/null 2>&1; then
+                echo "sudo dnf install fzf"
+            elif command -v pacman >/dev/null 2>&1; then
+                echo "sudo pacman -S fzf"
+            elif command -v zypper >/dev/null 2>&1; then
+                echo "sudo zypper install fzf"
+            elif command -v apk >/dev/null 2>&1; then
+                echo "sudo apk add fzf"
+            elif command -v xbps-install >/dev/null 2>&1; then
+                echo "sudo xbps-install -S fzf"
+            elif command -v pkg >/dev/null 2>&1; then
+                echo "pkg install fzf"
+            elif command -v pkg_add >/dev/null 2>&1; then
+                echo "pkg_add fzf"
+            elif command -v pkgin >/dev/null 2>&1; then
+                echo "pkgin install fzf"
+            elif command -v emerge >/dev/null 2>&1; then
+                echo "emerge --ask app-shells/fzf"
+            elif command -v nix-env >/dev/null 2>&1; then
+                echo "nix-env -iA nixpkgs.fzf"
+            else
+                echo "https://github.com/junegunn/fzf#installation"
+            fi
+            ;;
+        git)
+            if command -v brew >/dev/null 2>&1; then
+                echo "brew install git"
+            elif command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
+                echo "sudo apt install git"
+            elif command -v dnf >/dev/null 2>&1; then
+                echo "sudo dnf install git"
+            elif command -v pacman >/dev/null 2>&1; then
+                echo "sudo pacman -S git"
+            elif command -v zypper >/dev/null 2>&1; then
+                echo "sudo zypper install git"
+            elif command -v apk >/dev/null 2>&1; then
+                echo "sudo apk add git"
+            elif command -v xbps-install >/dev/null 2>&1; then
+                echo "sudo xbps-install -S git"
+            elif command -v pkg >/dev/null 2>&1; then
+                echo "pkg install git"
+            elif command -v pkg_add >/dev/null 2>&1; then
+                echo "pkg_add git"
+            elif command -v pkgin >/dev/null 2>&1; then
+                echo "pkgin install git"
+            elif command -v emerge >/dev/null 2>&1; then
+                echo "emerge --ask dev-vcs/git"
+            elif command -v nix-env >/dev/null 2>&1; then
+                echo "nix-env -iA nixpkgs.git"
+            else
+                echo "https://git-scm.com/downloads"
+            fi
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+require_command() {
+    local cmd="$1" purpose="${2:-}"
+    local hint
+
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+
+    hint=$(install_hint_for "$cmd")
+    if [[ -n "$purpose" ]]; then
+        die "$cmd is required for $purpose. Install it with: $hint"
+    fi
+
+    die "$cmd is required. Install it with: $hint"
+}
+
 # A stale worktree cannot prune itself because its directory is already gone.
 # We need any surviving checkout from the SAME repo whose worktree metadata
 # still contains the missing path.
@@ -68,6 +158,46 @@ worktree_known_to_git_context() {
     git -C "$git_ctx" rev-parse --git-dir >/dev/null 2>&1 || return 1
     git -C "$git_ctx" worktree list --porcelain 2>/dev/null \
         | grep -qxF "worktree $wt_path"
+}
+
+worktree_state_from_context() {
+    local git_ctx="$1" wt_path="$2"
+    git -C "$git_ctx" rev-parse --git-dir >/dev/null 2>&1 || return 1
+
+    # We only need one worktree's state, but Git gives us the whole porcelain
+    # stream. Walk the records once and return the state for the matching path.
+    #
+    # Why this helper exists:
+    # - A stale/prunable worktree can still have files on disk.
+    # - "Directory exists" and "valid worktree" are different questions.
+    # - Ctrl-X needs Git's opinion about the entry, not just the filesystem.
+    local current_path="" state="branch" locked=""
+    local line
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ -z "$line" ]]; then
+            if [[ "$current_path" == "$wt_path" ]]; then
+                printf '%s\t%s\n' "$state" "$locked"
+                return 0
+            fi
+            current_path="" state="branch" locked=""
+            continue
+        fi
+
+        case "$line" in
+            worktree\ *) current_path="${line#worktree }" ;;
+            detached)    state="detached" ;;
+            prunable*)   state="prunable" ;;
+            locked*)     locked="yes" ;;
+        esac
+    done < <(git -C "$git_ctx" worktree list --porcelain 2>/dev/null)
+
+    if [[ "$current_path" == "$wt_path" ]]; then
+        printf '%s\t%s\n' "$state" "$locked"
+        return 0
+    fi
+
+    return 1
 }
 
 # Prefer the explicit repo context passed from the dashboard. That matters when
@@ -275,6 +405,100 @@ truncate_str() {
     fi
 }
 
+# Keep both ends of a long identifier visible.
+#
+# Why this exists:
+# - Worktree paths usually share a long common prefix.
+# - The part that distinguishes one worktree from another is often near the end.
+# - Normal left-to-right truncation hides exactly that useful tail.
+#
+# Example:
+#   /Users/me/src/monolith/feature/auth-refresh
+# becomes
+#   /Users/me/src…feature/auth-refresh
+truncate_middle() {
+    local str="$1" max="$2"
+    if (( ${#str} <= max )); then
+        echo "$str"
+        return
+    fi
+
+    if (( max < 5 )); then
+        truncate_str "$str" "$max"
+        return
+    fi
+
+    local left right
+    left=$(( (max - 1) / 2 ))
+    right=$(( max - 1 - left ))
+    echo "${str:0:$left}…${str: -$right}"
+}
+
+terminal_columns() {
+    local cols
+    cols=$(tput cols 2>/dev/null || true)
+    if [[ ! "$cols" =~ ^[0-9]+$ ]] || (( cols <= 0 )); then
+        cols=80
+    fi
+    echo "$cols"
+}
+
+terminal_lines() {
+    local lines
+    lines=$(tput lines 2>/dev/null || true)
+    if [[ ! "$lines" =~ ^[0-9]+$ ]] || (( lines <= 0 )); then
+        lines=24
+    fi
+    echo "$lines"
+}
+
+preview_columns() {
+    local cols="${FZF_PREVIEW_COLUMNS:-}"
+    # When fzf runs a preview command it tells us the actual preview width via
+    # FZF_PREVIEW_COLUMNS. Outside fzf (manual testing, docs examples, plain
+    # script calls) that variable does not exist, so we fall back to the
+    # current terminal width.
+    if [[ ! "$cols" =~ ^[0-9]+$ ]] || (( cols <= 0 )); then
+        cols=$(terminal_columns)
+    fi
+    echo "$cols"
+}
+
+# "Compact" means "this preview pane is too narrow for table-like rows".
+# Once we cross that point, stacked multi-line output is easier to read than
+# trying to preserve columns that will wrap into each other.
+preview_is_compact() {
+    local cols
+    cols=$(preview_columns)
+    (( cols < 72 ))
+}
+
+# Pick the preview placement from the terminal shape instead of hardcoding a
+# right-side split for every terminal.
+#
+# Design rule:
+# - Wide terminals can afford side-by-side list + preview.
+# - Narrow terminals cannot, so the preview must move below the list.
+#
+# The exact numbers are heuristics, not protocol. If this is ever retuned,
+# keep the first-principles goal the same: preserve the list's identifying path
+# column first, then give the preview whatever space remains.
+choose_preview_window() {
+    local cols lines
+    cols=$(terminal_columns)
+    lines=$(terminal_lines)
+
+    if (( cols >= 150 && cols >= lines * 2 )); then
+        echo "right,55%,wrap"
+    elif (( cols >= 120 && cols >= lines * 3 / 2 )); then
+        echo "right,50%,wrap"
+    elif (( lines >= 40 )); then
+        echo "down,45%,wrap"
+    else
+        echo "down,55%,wrap"
+    fi
+}
+
 # Convert unix timestamp to compact relative time: 1709312400 → "3d ago"
 timestamp_to_relative() {
     local ts="$1" now="$2"
@@ -291,53 +515,37 @@ timestamp_to_relative() {
     fi
 }
 
-# Find the most recent commit across a worktree and all its submodules.
+# Find the newest commit visible from a worktree and its initialized
+# submodules. This is intentionally expensive, so callers should only use it in
+# lazy or background paths, never in the synchronous startup list.
 #
-# In monorepos the worktree HEAD is often just a pointer-bump commit like
-# "Bump backend submodule". The real work happens inside the submodules.
-# This function looks at BOTH the worktree HEAD and every submodule HEAD,
-# then returns whichever commit is newest — giving you the actual latest
-# activity regardless of where it happened.
+# Output is written to globals instead of echoing a delimited string. That
+# keeps commit subjects tab-safe: `%s` can contain literal tab characters, so
+# tab-delimited parsing would corrupt the subject/source split.
 #
-# Returns a single tab-delimited line (no trailing newline):
-#   <unix_timestamp>\t<commit_subject>\t<source>
-#
-# Parse it in the caller with:
-#   IFS=$'\t' read -r ts subject source <<< "$(get_newest_commit ...)"
-#
-# The <source> field tells you WHERE the commit came from:
-#   ""           → the worktree itself (its own HEAD)
-#   "backend"    → the "backend" submodule had the newest commit
-#
-# For repos without submodules, this simply returns the worktree HEAD info.
-#
-# Uses printf (not echo) to avoid a trailing newline — command substitution
-# in the caller strips it cleanly, and IFS+read parses the tabs.
+# Sets:
+#   NEWEST_COMMIT_TS
+#   NEWEST_COMMIT_SUBJECT
+#   NEWEST_COMMIT_SOURCE
 get_newest_commit() {
-    local wt_path="$1" head_sha="$2" git_ctx="$3"
+    local wt_path="$1"
 
-    # Start with the worktree's own HEAD commit.
-    # --format=$'%ct\t%s' gives us "unix_timestamp<TAB>subject" in one call.
+    NEWEST_COMMIT_TS=0
+    NEWEST_COMMIT_SUBJECT=""
+    NEWEST_COMMIT_SOURCE=""
+
+    [[ -d "$wt_path" ]] || return
+
     local mono_info
-    mono_info=$(git -C "$git_ctx" log -1 --format=$'%ct\t%s' "$head_sha" 2>/dev/null) || { printf '0\t—\t'; return; }
+    mono_info=$(git -C "$wt_path" log -1 --format=$'%ct\t%s' HEAD 2>/dev/null) || return
 
-    # Split on TAB using bash parameter expansion (no subprocess):
-    #   ${var%%<TAB>*}  → everything BEFORE the first tab  (timestamp)
-    #   ${var#*<TAB>}   → everything AFTER the first tab   (subject)
-    local max_ts="${mono_info%%	*}"
-    local max_subject="${mono_info#*	}"
-    local max_source=""
+    NEWEST_COMMIT_TS="${mono_info%%	*}"
+    NEWEST_COMMIT_SUBJECT="${mono_info#*	}"
 
-    # No submodules? The worktree HEAD is all we have.
-    if [[ ! -d "$wt_path" || ! -f "$wt_path/.gitmodules" ]]; then
-        printf '%s\t%s\t%s' "$max_ts" "$max_subject" "$max_source"
+    if [[ ! -f "$wt_path/.gitmodules" ]]; then
         return
     fi
 
-    # Walk each submodule and keep the newest commit.
-    # Uses -z for NUL-delimited output so paths with spaces parse correctly.
-    # Each entry is "key\nvalue\0" — we split on NUL, then extract the value
-    # (everything after the first newline).
     local sub_path sub_info sub_ts entry
     while IFS= read -r -d '' entry; do
         [[ -z "$entry" ]] && continue
@@ -345,39 +553,12 @@ get_newest_commit() {
         [[ -d "$wt_path/$sub_path" ]] || continue
         sub_info=$(git -C "$wt_path/$sub_path" log -1 --format=$'%ct\t%s' HEAD 2>/dev/null) || continue
         sub_ts="${sub_info%%	*}"
-        if (( sub_ts > max_ts )); then
-            max_ts="$sub_ts"
-            max_subject="${sub_info#*	}"
-            max_source="$sub_path"
+        if (( sub_ts > NEWEST_COMMIT_TS )); then
+            NEWEST_COMMIT_TS="$sub_ts"
+            NEWEST_COMMIT_SUBJECT="${sub_info#*	}"
+            NEWEST_COMMIT_SOURCE="$sub_path"
         fi
     done < <(git -C "$wt_path" config --file .gitmodules -z --get-regexp 'submodule\..*\.path' 2>/dev/null)
-
-    printf '%s\t%s\t%s' "$max_ts" "$max_subject" "$max_source"
-}
-
-# Resolve a meaningful name for a detached HEAD worktree
-resolve_detached_name() {
-    local wt_path="$1"
-
-    if [[ ! -d "$wt_path" ]]; then
-        echo "(detached)"
-        return
-    fi
-
-    # git describe --all finds the nearest ref (branch, tag, remote)
-    # --always falls back to short SHA if nothing else matches
-    local ref
-    ref=$(git -C "$wt_path" describe --all --always HEAD 2>/dev/null) || ref=""
-
-    if [[ -n "$ref" ]]; then
-        # Strip verbose prefixes: heads/main → main, remotes/origin/dev → origin/dev
-        ref="${ref#heads/}"
-        ref="${ref#remotes/}"
-        ref="${ref#tags/}"
-        echo "$ref"
-    else
-        echo "(detached)"
-    fi
 }
 
 # =============================================================================
@@ -385,35 +566,32 @@ resolve_detached_name() {
 # =============================================================================
 
 # Parses `git worktree list --porcelain` into parallel arrays.
-# Sets: WT_PATHS, WT_HEADS, WT_BRANCHES, WT_STATES, WT_LOCKED
+# Sets: WT_PATHS, WT_BRANCHES, WT_STATES, WT_LOCKED
 parse_worktrees() {
     local git_args=("worktree" "list" "--porcelain")
     [[ -n "${REPO_PATH:-}" ]] && git_args=("-C" "$REPO_PATH" "${git_args[@]}")
 
     WT_PATHS=()
-    WT_HEADS=()
     WT_BRANCHES=()
     WT_STATES=()
     WT_LOCKED=()
 
-    local path="" head="" branch="" state="branch" locked=""
+    local path="" branch="" state="branch" locked=""
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ -z "$line" ]]; then
             if [[ -n "$path" ]]; then
                 WT_PATHS+=("$(canonical_path "$path")")
-                WT_HEADS+=("$head")
                 WT_BRANCHES+=("$branch")
                 WT_STATES+=("$state")
                 WT_LOCKED+=("$locked")
             fi
-            path="" head="" branch="" state="branch" locked=""
+            path="" branch="" state="branch" locked=""
             continue
         fi
 
         case "$line" in
             worktree\ *)  path="${line#worktree }" ;;
-            HEAD\ *)      head="${line#HEAD }" ;;
             branch\ *)    branch="${line#branch refs/heads/}" ;;
             detached)     state="detached" ;;
             prunable*)    state="prunable" ;;
@@ -424,10 +602,94 @@ parse_worktrees() {
     # Handle last block (porcelain output may not end with a blank line)
     if [[ -n "$path" ]]; then
         WT_PATHS+=("$(canonical_path "$path")")
-        WT_HEADS+=("$head")
         WT_BRANCHES+=("$branch")
         WT_STATES+=("$state")
         WT_LOCKED+=("$locked")
+    fi
+}
+
+# Most worktree setups put sibling worktrees next to the main checkout. Use
+# that parent directory as the default "base" for list display and header text.
+#
+# Why not use the strict common prefix of every worktree path?
+# Because one odd path in /tmp or another directory would force the shared
+# prefix all the way back to "/", which makes every normal worktree row worse.
+worktree_base_dir() {
+    (( ${#WT_PATHS[@]} == 0 )) && return
+
+    local base
+    base=$(dirname "${WT_PATHS[0]}")
+    [[ "$base" != */ ]] && base="$base/"
+    printf '%s\n' "$base"
+}
+
+# The list must stay cheap because fzf waits for the full list before the UI
+# appears. That means the list may only use metadata we already got from
+# `git worktree list --porcelain`.
+#
+# Anything more expensive, especially `git log` across worktrees or submodules,
+# belongs in the preview because the preview is lazy and only runs for the
+# highlighted row.
+list_row_label() {
+    local index="$1"
+    local state="${WT_STATES[$index]}"
+    local branch="${WT_BRANCHES[$index]}"
+    local locked="${WT_LOCKED[$index]}"
+
+    if [[ -n "$locked" ]]; then
+        if [[ -n "$branch" ]]; then
+            printf 'locked • %s\n' "$branch"
+        else
+            printf 'locked\n'
+        fi
+        return
+    fi
+
+    case "$state" in
+        prunable)
+            printf 'prunable\n'
+            ;;
+        detached)
+            printf 'detached\n'
+            ;;
+        *)
+            printf '%s\n' "${branch:-branch}"
+            ;;
+    esac
+}
+
+ensure_repo_context() {
+    # Validate repo before parsing — commands like --list can be called
+    # directly by fzf reload actions, so we cannot rely on main() having
+    # already done the repo validation.
+    if [[ -n "${REPO_PATH:-}" ]]; then
+        git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1 \
+            || die "Not a git repository: $REPO_PATH"
+    else
+        git rev-parse --git-dir >/dev/null 2>&1 \
+            || die "Not inside a git repository"
+    fi
+}
+
+activity_row_payload() {
+    local wt_path="$1" fallback="$2" now="$3"
+    ACTIVITY_ROW_TS=0
+    ACTIVITY_ROW_AGE="—"
+    ACTIVITY_ROW_SUBJECT="$fallback"
+
+    # This is the bridge between the fast startup list and the richer
+    # activity-sorted list. If history lookup fails, keep the cheap fallback
+    # label instead of failing the whole background refresh.
+    get_newest_commit "$wt_path"
+
+    if [[ "$NEWEST_COMMIT_TS" != "0" ]]; then
+        ACTIVITY_ROW_TS="$NEWEST_COMMIT_TS"
+        ACTIVITY_ROW_AGE=$(timestamp_to_relative "$NEWEST_COMMIT_TS" "$now")
+        if [[ -n "$NEWEST_COMMIT_SOURCE" ]]; then
+            ACTIVITY_ROW_SUBJECT="${NEWEST_COMMIT_SOURCE}: ${NEWEST_COMMIT_SUBJECT}"
+        elif [[ -n "$NEWEST_COMMIT_SUBJECT" ]]; then
+            ACTIVITY_ROW_SUBJECT="$NEWEST_COMMIT_SUBJECT"
+        fi
     fi
 }
 
@@ -435,56 +697,30 @@ parse_worktrees() {
 # List Command
 # =============================================================================
 
-# Outputs tab-delimited rows for fzf, sorted by most recent activity.
+# Outputs tab-delimited rows for fzf using only cheap worktree metadata.
 # Field 1 (hidden): full worktree path
-# Field 2 (visible): icon, branch, age, commit, short_name
+# Field 2 (visible): icon, worktree path, branch/state label
 cmd_list() {
-    # Validate repo before parsing — --list can be called directly by fzf
-    # reload, so we can't rely on main() having validated first.
-    if [[ -n "${REPO_PATH:-}" ]]; then
-        git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1 \
-            || { die "Not a git repository: $REPO_PATH"; }
-    else
-        git rev-parse --git-dir >/dev/null 2>&1 \
-            || { die "Not inside a git repository"; }
-    fi
-
+    require_command git "worktree inspection"
+    ensure_repo_context
     parse_worktrees
 
     if (( ${#WT_PATHS[@]} == 0 )); then
         return
     fi
 
-    # Find a valid worktree path for git log lookups (all share the same object store)
-    local git_ctx=""
-    for wt in "${WT_PATHS[@]}"; do
-        [[ -d "$wt" ]] && { git_ctx="$wt"; break; }
-    done
+    local base_dir=""
+    base_dir=$(worktree_base_dir)
 
-    # Compute common directory prefix — strip shared noise from path column
-    local common_prefix=""
-    if (( ${#WT_PATHS[@]} > 1 )); then
-        common_prefix="${WT_PATHS[0]}"
-        local j
-        for (( j = 1; j < ${#WT_PATHS[@]}; j++ )); do
-            while [[ "${WT_PATHS[$j]}" != "$common_prefix"* ]]; do
-                common_prefix="${common_prefix%/*}"
-            done
-        done
-        [[ -n "$common_prefix" && "$common_prefix" != */ ]] && common_prefix="$common_prefix/"
-    fi
-
-    local now current_wt i
-    now=$(date +%s)
+    local current_wt i
     current_wt=$(canonical_path "${PWD:-}")
 
-    # Collect rows with sort key: "timestamp\x1fformatted_row"
+    # Sort current first, then regular worktrees, then detached, then stale.
+    # This is cheap to compute and keeps the fast-startup list predictable.
     local rows=()
 
     for (( i = 0; i < ${#WT_PATHS[@]}; i++ )); do
         local path="${WT_PATHS[$i]}"
-        local head="${WT_HEADS[$i]}"
-        local branch="${WT_BRANCHES[$i]}"
         local state="${WT_STATES[$i]}"
 
         # Determine icon and color — current worktree takes priority
@@ -509,61 +745,115 @@ cmd_list() {
             icon="🔒" color="$DIM"
         fi
 
-        # Branch display — resolve detached HEADs to nearest ref
-        local branch_display
-        case "$state" in
-            prunable) branch_display="(prunable)" ;;
-            detached) branch_display=$(resolve_detached_name "$path") ;;
-            *)        branch_display="$branch" ;;
-        esac
-        branch_display=$(truncate_str "$branch_display" 24)
-
-        # Most recent activity across worktree + submodules.
-        # get_newest_commit returns timestamp, subject, and which repo the
-        # commit came from — all in one call. We parse with IFS+read (a
-        # bash builtin) to avoid subprocess forks per worktree.
-        local max_ts=0 age="—" subject="—"
-        if [[ -n "$head" && -n "$git_ctx" ]]; then
-            local raw_subject raw_source
-            IFS=$'\t' read -r max_ts raw_subject raw_source <<< "$(get_newest_commit "$path" "$head" "$git_ctx")"
-
-            if [[ "$max_ts" != "0" ]]; then
-                age=$(timestamp_to_relative "$max_ts" "$now")
-            fi
-
-            # When the newest commit is from a submodule, prefix the subject
-            # so the user can see at a glance where the work happened:
-            #   "backend: fix auth refresh"  (submodule source → prefixed)
-            #   "update CI config"           (worktree itself → no prefix)
-            if [[ -n "$raw_source" ]]; then
-                subject=$(truncate_str "${raw_source}: ${raw_subject}" 40)
-            else
-                subject=$(truncate_str "$raw_subject" 40)
-            fi
-        fi
-
-        # Path display — strip common prefix to show just the unique name
-        local display_path
-        if [[ -n "$common_prefix" ]]; then
-            display_path="${path#"$common_prefix"}"
+        # The visible row puts the path before commit text on purpose.
+        # The path answers "which worktree is this?" while the dim label only
+        # answers "what state is it in?" Identity comes first.
+        local sort_path display_path
+        if [[ -n "$base_dir" && "$path" == "$base_dir"* ]]; then
+            sort_path="${path#"$base_dir"}"
+            display_path="$sort_path"
         else
+            sort_path="$path"
             display_path=$(shorten_path "$path")
         fi
+        display_path=$(truncate_middle "$display_path" 30)
 
-        # Collect: sort_key\x1fformatted_row
+        local label sort_group
+        label=$(truncate_str "$(list_row_label "$i")" 24)
+
+        if $is_current; then
+            sort_group=0
+        else
+            case "$state" in
+                detached) sort_group=2 ;;
+                prunable) sort_group=3 ;;
+                *)        sort_group=1 ;;
+            esac
+        fi
+
+        # Collect: group\x1fpath_sort_key\x1fformatted_row
         local row
-        row=$(printf "%s\x1f %s%s %-24s%s  %s%-10s%s  %-40s  %s%s%s" \
+        row=$(printf "%s\x1f %s%s %-30s%s  %s%s%s" \
             "$path" \
-            "$color" "$icon" "$branch_display" "$NC" \
-            "$DIM" "$age" "$NC" \
-            "$subject" \
-            "$DIM" "$display_path" "$NC")
+            "$color" "$icon" "$display_path" "$NC" \
+            "$DIM" "$label" "$NC")
 
-        rows+=("${max_ts}"$'\x1f'"${row}")
+        rows+=("${sort_group}"$'\x1f'"${sort_path}"$'\x1f'"${row}")
     done
 
-    # Sort by timestamp descending (most recent first) and output
-    printf '%s\n' "${rows[@]}" | sort -t$'\x1f' -k1,1 -rn | cut -d$'\x1f' -f2-
+    printf '%s\n' "${rows[@]}" | sort -t$'\x1f' -k1,1n -k2,2f | cut -d$'\x1f' -f3-
+}
+
+cmd_list_activity() {
+    require_command git "worktree activity inspection"
+    ensure_repo_context
+
+    parse_worktrees
+
+    if (( ${#WT_PATHS[@]} == 0 )); then
+        return
+    fi
+
+    local base_dir=""
+    base_dir=$(worktree_base_dir)
+
+    local current_wt now i
+    current_wt=$(canonical_path "${PWD:-}")
+    now=$(date +%s)
+
+    local rows=()
+
+    for (( i = 0; i < ${#WT_PATHS[@]}; i++ )); do
+        local path="${WT_PATHS[$i]}"
+        local state="${WT_STATES[$i]}"
+
+        local icon color is_current=false
+        if [[ -n "$current_wt" && ( "$current_wt" == "$path" || "$current_wt" == "$path/"* ) ]]; then
+            is_current=true
+        fi
+
+        if $is_current; then
+            icon="●" color="$GREEN"
+        else
+            case "$state" in
+                prunable)  icon="✗" color="$RED" ;;
+                detached)  icon="◌" color="$YELLOW" ;;
+                *)         icon="○" color="$BLUE" ;;
+            esac
+        fi
+
+        if [[ -n "${WT_LOCKED[$i]}" ]]; then
+            icon="🔒" color="$DIM"
+        fi
+
+        local sort_path display_path
+        if [[ -n "$base_dir" && "$path" == "$base_dir"* ]]; then
+            sort_path="${path#"$base_dir"}"
+            display_path="$sort_path"
+        else
+            sort_path="$path"
+            display_path=$(shorten_path "$path")
+        fi
+        display_path=$(truncate_middle "$display_path" 30)
+
+        local fallback_label max_ts age subject
+        fallback_label=$(list_row_label "$i")
+        activity_row_payload "$path" "$fallback_label" "$now"
+        max_ts="$ACTIVITY_ROW_TS"
+        age="$ACTIVITY_ROW_AGE"
+        subject=$(truncate_str "$ACTIVITY_ROW_SUBJECT" 52)
+
+        local row
+        row=$(printf "%s\x1f %s%s %-30s%s  %s%-8s%s  %s" \
+            "$path" \
+            "$color" "$icon" "$display_path" "$NC" \
+            "$DIM" "$age" "$NC" \
+            "$subject")
+
+        rows+=("${max_ts}"$'\x1f'"${sort_path}"$'\x1f'"${row}")
+    done
+
+    printf '%s\n' "${rows[@]}" | sort -t$'\x1f' -k1,1rn -k2,2f | cut -d$'\x1f' -f3-
 }
 
 # =============================================================================
@@ -572,10 +862,203 @@ cmd_list() {
 
 section_header() {
     local title="$1"
-    local width=48
+    local width
+    # Keep section dividers visually tied to the real preview width so the
+    # preview still feels intentional in both narrow and wide panes.
+    width=$(preview_columns)
+    width=$(( width - 6 ))
+    (( width < 24 )) && width=24
+    (( width > 72 )) && width=72
     local pad=$(( width - ${#title} - 5 ))
     (( pad < 2 )) && pad=2
     printf "\n%s─── %s %s%s\n" "$BOLD" "$title" "$(printf '─%.0s' $(seq 1 "$pad"))" "$NC"
+}
+
+print_activity_line() {
+    local rel="$1" hash="$2" subject="$3" source="${4:-}"
+    local cols compact_width compact_subject_width
+    cols=$(preview_columns)
+    compact_width=$(( cols - 4 ))
+    compact_subject_width=$(( compact_width - 20 ))
+    (( compact_width < 12 )) && compact_width=12
+    (( compact_subject_width < 12 )) && compact_subject_width=12
+
+    # In compact mode we stop pretending we have room for aligned columns.
+    # A short stacked block is easier to scan than wrapped pseudo-columns.
+    if preview_is_compact; then
+        printf "  %-8s  ${YELLOW}%s${NC}\n" "$rel" "$hash"
+        if [[ -n "$source" ]]; then
+            printf "    ${DIM}%s${NC}  %s\n" "$(truncate_str "$source" 18)" "$(truncate_str "$subject" "$compact_subject_width")"
+        else
+            printf "    %s\n" "$(truncate_str "$subject" "$compact_width")"
+        fi
+        return
+    fi
+
+    local rel_width=8 hash_width=10 source_width=0 subject_width
+    hash=$(truncate_str "$hash" "$hash_width")
+
+    if [[ -n "$source" ]]; then
+        source_width=$(( cols / 5 ))
+        (( source_width < 10 )) && source_width=10
+        (( source_width > 18 )) && source_width=18
+        source=$(truncate_str "$source" "$source_width")
+    fi
+
+    # Keep each activity row as one left-aligned thought instead of splitting
+    # the source into a detached far-right column. The source is metadata, but
+    # it is still part of the sentence the user is reading.
+    subject_width=$(( cols - (2 + rel_width + 2 + hash_width + 2) ))
+    if (( source_width > 0 )); then
+        subject_width=$(( cols - (2 + rel_width + 2 + hash_width + 2 + source_width + 2) ))
+    fi
+    (( subject_width < 16 )) && subject_width=16
+    subject=$(truncate_str "$subject" "$subject_width")
+
+    # In wide mode we keep the one-line timeline feel with a compact source tag
+    # near the hash so every row stays visually connected.
+    if (( source_width > 0 )); then
+        printf "  %-*s  ${YELLOW}%-*s${NC}  ${DIM}%-*s${NC}  %s\n" \
+            "$rel_width" "$rel" "$hash_width" "$hash" "$source_width" "$source" "$subject"
+    else
+        printf "  %-*s  ${YELLOW}%-*s${NC}  %s\n" \
+            "$rel_width" "$rel" "$hash_width" "$hash" "$subject"
+    fi
+}
+
+# Render submodule rows with the same rule as activity rows:
+# preserve columns when there is room, otherwise switch to a stacked summary.
+print_submodule_line() {
+    local sync_icon="$1" dirty="$2" name="$3" branch="$4" age="$5" subject="$6"
+    local cols dirty_display compact_branch_width compact_subject_width
+    cols=$(preview_columns)
+    compact_branch_width=$(( cols / 3 ))
+    compact_subject_width=$(( cols - 8 ))
+    (( compact_branch_width < 10 )) && compact_branch_width=10
+    (( compact_subject_width < 16 )) && compact_subject_width=16
+
+    dirty_display=" "
+    [[ -n "$dirty" ]] && dirty_display="${YELLOW}*${NC}"
+
+    if preview_is_compact; then
+        printf "  %s %s%s\n" "$sync_icon" "$dirty_display" "$name"
+        printf "    %s%s%s  ${DIM}•${NC}  %s  ${DIM}•${NC}  %s\n" \
+            "$DIM" "$(truncate_str "$branch" "$compact_branch_width")" "$NC" "$age" "$(truncate_str "$subject" "$compact_subject_width")"
+        return
+    fi
+
+    local name_width branch_width subject_width
+    name_width=$(( cols / 4 ))
+    (( name_width < 16 )) && name_width=16
+    (( name_width > 24 )) && name_width=24
+
+    branch_width=$(( cols / 5 ))
+    (( branch_width < 12 )) && branch_width=12
+    (( branch_width > 18 )) && branch_width=18
+
+    subject_width=$(( cols - 22 - name_width - branch_width ))
+    (( subject_width < 16 )) && subject_width=16
+
+    name=$(truncate_str "$name" "$name_width")
+    branch=$(truncate_str "$branch" "$branch_width")
+    subject=$(truncate_str "$subject" "$subject_width")
+
+    printf "  %s %s%-*s %s%-*s%s  %-8s  %s\n" \
+        "$sync_icon" "$dirty_display" "$name_width" "$name" \
+        "$DIM" "$branch_width" "$branch" "$NC" "$age" "$subject"
+}
+
+wait_for_fzf_socket() {
+    local socket_path="$1"
+    local attempt=0
+
+    while (( attempt < 200 )); do
+        [[ -S "$socket_path" ]] && return 0
+        sleep 0.05
+        attempt=$(( attempt + 1 ))
+    done
+
+    return 1
+}
+
+post_fzf_action() {
+    local socket_path="$1" action="$2"
+
+    command -v curl >/dev/null 2>&1 || return 1
+    [[ -S "$socket_path" ]] || return 1
+
+    # fzf's --listen mode exposes a tiny local HTTP endpoint over a Unix socket.
+    # We always talk to "localhost" here so the request shape stays obvious when
+    # someone copies the curl command out to debug it by hand.
+    curl --silent --show-error --unix-socket "$socket_path" http://localhost/ \
+        -d "$action" >/dev/null 2>&1
+}
+
+start_async_refresh() {
+    local socket_path="${1:?Missing fzf socket path}"
+    local output_path="${2:?Missing activity output path}"
+    local token_file="${3:?Missing refresh token file}"
+    local repo_path="${4:-}"
+    local token
+
+    command -v curl >/dev/null 2>&1 || return 0
+
+    # Every refresh gets a new token. The worker will only publish its results
+    # if the token is still current when it finishes. That keeps an older,
+    # slower refresh from overwriting a newer one.
+    token="$(date +%s)-$$-$RANDOM-$RANDOM"
+    printf '%s' "$token" > "$token_file"
+
+    if [[ -n "${WT_CAN_CHANGE_LIST_LABEL:-}" ]]; then
+        post_fzf_action "$socket_path" "change-list-label(worktrees · loading activity...)" || true
+    fi
+
+    "$SELF" --action-async-refresh "$socket_path" "$output_path" "$token_file" "$token" "$repo_path" \
+        >/dev/null 2>&1 &
+}
+
+# Build the expensive "latest activity" list off the critical startup path,
+# then ask the running fzf instance to reload from the finished file.
+#
+# First principles:
+# - Startup should not block on hundreds of git log calls.
+# - Users still benefit from newest-first ordering once that data exists.
+# - The right tradeoff is "show a fast list now, then upgrade it in place."
+action_async_refresh() {
+    local socket_path="${1:?Missing fzf socket path}"
+    local output_path="${2:?Missing activity output path}"
+    local token_file="${3:?Missing refresh token file}"
+    local expected_token="${4:?Missing refresh token}"
+    REPO_PATH="${5:-}"
+    local output_q
+
+    require_command git "worktree activity refresh"
+    command -v curl >/dev/null 2>&1 || return 0
+
+    wait_for_fzf_socket "$socket_path" || return 0
+
+    [[ -f "$token_file" ]] || return 0
+    [[ "$(cat "$token_file" 2>/dev/null)" == "$expected_token" ]] || return 0
+
+    local tmp_output="${output_path}.tmp.$$"
+    cmd_list_activity > "$tmp_output" || { rm -f "$tmp_output"; return 0; }
+
+    [[ -f "$token_file" ]] || { rm -f "$tmp_output"; return 0; }
+    [[ "$(cat "$token_file" 2>/dev/null)" == "$expected_token" ]] || { rm -f "$tmp_output"; return 0; }
+
+    mv -f "$tmp_output" "$output_path"
+    # fzf evaluates reload(...) as a shell command. The temp path comes from
+    # mktemp and may live under a TMPDIR with spaces, so quote it before
+    # sending it across the socket.
+    output_q=$(printf '%q' "$output_path")
+
+    # Ask fzf to keep tracking the current item if possible, then replace the
+    # fast list with the enriched activity-sorted list.
+    if [[ -n "${WT_CAN_CHANGE_LIST_LABEL:-}" ]]; then
+        post_fzf_action "$socket_path" "track-current+reload(cat $output_q)+change-list-label(worktrees · latest activity)" || true
+    else
+        post_fzf_action "$socket_path" "track-current+reload(cat $output_q)" || true
+    fi
 }
 
 cmd_preview() {
@@ -584,6 +1067,21 @@ cmd_preview() {
     if [[ ! -d "$wt_path" ]]; then
         echo "${RED}Worktree directory does not exist${NC}"
         echo "${DIM}This worktree may need to be pruned.${NC}"
+        return
+    fi
+
+    require_command git "preview rendering"
+
+    # ── Worktree ────────────────────────────────────────
+    section_header "Worktree"
+    printf "  %s%s%s\n" "$BOLD" "$(basename "$wt_path")" "$NC"
+    printf "  %s%s%s\n" "$DIM" "$(shorten_path "$wt_path")" "$NC"
+
+    if ! git -C "$wt_path" rev-parse --git-dir >/dev/null 2>&1; then
+        section_header "State"
+        printf "  %sStale directory%s\n" "$YELLOW" "$NC"
+        echo "  ${DIM}This path still exists on disk but is no longer a valid Git worktree.${NC}"
+        echo "  ${DIM}Use Ctrl-X to prune the stale worktree entry.${NC}"
         return
     fi
 
@@ -606,7 +1104,7 @@ cmd_preview() {
     #   3d ago     i7j8k9l  Bump backend pointer
     #
     # Worktree commits have no label (they're implied).
-    # Submodule commits show their source name right-aligned in dim text.
+    # Submodule commits show their source name in dim text.
     #
     # For repos without submodules this just shows the worktree's own
     # recent commits — no label column, nothing different.
@@ -622,11 +1120,9 @@ cmd_preview() {
         [[ -z "$cts" ]] && continue
         local crel
         crel=$(timestamp_to_relative "$cts" "$now_ts")
-        csubj=$(truncate_str "$csubj" 36)
-        # Each entry is stored as "timestamp\x1fformatted_line" so we can
-        # sort everything by recency later. \x1f (Unit Separator) is safe —
-        # it never appears in ANSI codes or git output.
-        activity_lines+=("${cts}"$'\x1f'"$(printf "  %-10s  ${YELLOW}%s${NC}  %-36s" "$crel" "$chash" "$csubj")")
+        # Store sortable fields first, then format after sorting so preview
+        # rendering can adapt to the actual pane width.
+        activity_lines+=("${cts}"$'\x1f'"${crel}"$'\x1f'"${chash}"$'\x1f'"${csubj}"$'\x1f')
     done < <(git -C "$wt_path" log -3 --format=$'%ct\t%h\t%s' 2>/dev/null)
 
     # Submodule commits (top 1 each) — only if submodules exist.
@@ -643,10 +1139,9 @@ cmd_preview() {
                 [[ -z "$sts" ]] && continue
                 local srel
                 srel=$(timestamp_to_relative "$sts" "$now_ts")
-                ssubj=$(truncate_str "$ssubj" 28)
                 # Submodule entries include the source name so the user can
                 # tell which repo the commit came from.
-                activity_lines+=("${sts}"$'\x1f'"$(printf "  %-10s  ${YELLOW}%s${NC}  %-28s  ${DIM}%s${NC}" "$srel" "$shash" "$ssubj" "$sub_path")")
+                activity_lines+=("${sts}"$'\x1f'"${srel}"$'\x1f'"${shash}"$'\x1f'"${ssubj}"$'\x1f'"${sub_path}")
             done < <(git -C "$wt_path/$sub_path" log -1 --format=$'%ct\t%h\t%s' HEAD 2>/dev/null)
         done < <(git -C "$wt_path" config --file .gitmodules -z --get-regexp 'submodule\..*\.path' 2>/dev/null)
     fi
@@ -654,8 +1149,11 @@ cmd_preview() {
     if (( ${#activity_lines[@]} == 0 )); then
         echo "  ${DIM}No commits${NC}"
     else
-        # Merge-sort all entries by timestamp (descending), take top 5.
-        printf '%s\n' "${activity_lines[@]}" | sort -t$'\x1f' -k1,1 -rn | head -5 | cut -d$'\x1f' -f2-
+        # Merge-sort all entries by timestamp (descending), take top 5, then
+        # render against the current preview width.
+        while IFS=$'\x1f' read -r _ts rel hash subject source; do
+            print_activity_line "$rel" "$hash" "$subject" "$source"
+        done < <(printf '%s\n' "${activity_lines[@]}" | sort -t$'\x1f' -k1,1 -rn | head -5)
     fi
 
     # ── Submodules ──────────────────────────────────────
@@ -678,7 +1176,7 @@ cmd_preview() {
     #   Branch  current branch via `git symbolic-ref --short HEAD`
     #           falls back to `git describe --all --always` for detached/tagged states
     #   Age     relative time of the latest commit (uses shared now_ts from Latest Activity)
-    #   Subject first line of the latest commit message, truncated to 28 chars
+    #   Subject first line of the latest commit message, width-trimmed to fit
     #
     # Not-initialized submodules ("-" prefix from `git submodule status`)
     # have no checkout on disk, so we can only show "(not initialized)".
@@ -720,9 +1218,9 @@ cmd_preview() {
             # Dirty marker — `git diff-index --quiet HEAD` exits non-zero
             # when there are staged OR unstaged changes (but not untracked
             # files). This is fast because it only stats tracked files.
-            local dirty=" "
+            local dirty=""
             if [[ -d "$sub_dir" ]]; then
-                git -C "$sub_dir" diff-index --quiet HEAD 2>/dev/null || dirty="${YELLOW}*${NC}"
+                git -C "$sub_dir" diff-index --quiet HEAD 2>/dev/null || dirty="*"
             fi
 
             # Branch — try symbolic-ref first (gives "main", "feat/dash"),
@@ -749,12 +1247,10 @@ cmd_preview() {
                     local sub_ts="${sub_log%%	*}"
                     sub_subject="${sub_log#*	}"
                     sub_age=$(timestamp_to_relative "$sub_ts" "$now_ts")
-                    sub_subject=$(truncate_str "$sub_subject" 28)
                 fi
             fi
 
-            printf "  %s %s%-20s %s%-16s  %-8s  %s\n" \
-                "$sync_icon" "$dirty" "$name" "$DIM" "$sub_branch" "$sub_age" "${sub_subject}${NC}"
+            print_submodule_line "$sync_icon" "$dirty" "$name" "$sub_branch" "$sub_age" "$sub_subject"
         done < <(git -C "$wt_path" submodule status 2>/dev/null)
     fi
 
@@ -797,6 +1293,8 @@ cmd_preview() {
 action_new() {
     local wt_path="$1"
 
+    require_command git "worktree creation"
+
     if [[ ! -d "$wt_path" ]]; then
         echo "${RED}Cannot create from a missing worktree. Prune the stale entry first.${NC}"
         return
@@ -823,12 +1321,69 @@ action_new() {
 action_delete() {
     local wt_path
     wt_path=$(canonical_path "$1")
+
+    require_command git "worktree deletion"
+
     # When invoked from the dashboard, arg 2 is the repo context that launched
     # wt. We use it for stale-entry pruning, because the missing worktree itself
     # may no longer provide a usable Git context.
     local preferred_ctx="${2:-}"
     local short_path
     short_path=$(shorten_path "$wt_path")
+    local metadata_state=""
+    local state_ctx="${preferred_ctx:-}"
+
+    if [[ -z "$state_ctx" && -d "$wt_path" ]]; then
+        state_ctx="$wt_path"
+    fi
+    if [[ -n "$state_ctx" ]] && ! git -C "$state_ctx" rev-parse --git-dir >/dev/null 2>&1; then
+        state_ctx=""
+    fi
+    if [[ -z "$state_ctx" ]]; then
+        state_ctx=$(find_prune_context "$wt_path" "$preferred_ctx" 2>/dev/null || true)
+    fi
+    if [[ -n "$state_ctx" ]]; then
+        IFS=$'\t' read -r metadata_state _metadata_locked <<< "$(worktree_state_from_context "$state_ctx" "$wt_path" 2>/dev/null || true)"
+    fi
+
+    # ── Prunable / stale metadata ─────────────────────────────────────
+    # Git can mark a worktree "prunable" even when the directory still exists.
+    # That usually means the directory is just leftover files and the worktree's
+    # gitdir/admin link is broken. Treat Git's stale state as authoritative so
+    # Ctrl-X can clean up both the metadata and the leftover directory.
+    if [[ "$metadata_state" == "prunable" ]]; then
+        echo "${DIM}Git already marks this worktree entry as stale.${NC}"
+
+        if [[ -e "$wt_path" ]]; then
+            echo "${DIM}The directory still exists on disk, but it is no longer a valid worktree.${NC}"
+            printf '%s%s%s' "${BOLD}Prune metadata and remove leftover directory " "$short_path" "? [y/N] ${NC}"
+        else
+            printf '%s%s%s' "${BOLD}Prune stale entry " "$short_path" "? [y/N] ${NC}"
+        fi
+
+        read -r confirm
+        if [[ "$confirm" =~ ^[yY]$ ]]; then
+            if prune_worktree_metadata "$wt_path" "$preferred_ctx"; then
+                if [[ -e "$wt_path" ]]; then
+                    delete_worktree_path "$wt_path" || true
+                    if [[ -e "$wt_path" ]]; then
+                        echo "${GREEN}✓${NC} Pruned metadata"
+                        return 1
+                    fi
+                    echo "${GREEN}✓${NC} Pruned and removed"
+                else
+                    echo "${GREEN}✓${NC} Pruned"
+                fi
+            else
+                echo "${RED}Could not find a valid git context to prune from.${NC}"
+                echo "${DIM}Try: git worktree prune --expire now (from any checkout of this repo)${NC}"
+                return 1
+            fi
+        else
+            echo "Cancelled."
+        fi
+        return
+    fi
 
     # ── Prunable (directory already gone) ─────────────────────────────
     if [[ ! -e "$wt_path" ]]; then
@@ -1014,8 +1569,7 @@ action_delete() {
 # =============================================================================
 
 show_help() {
-    cat <<EOF
-${BOLD}wt${NC} v${VERSION} — Interactive git worktree dashboard
+    printf '%b' "${BOLD}wt${NC} v${VERSION} — Interactive git worktree dashboard
 
 ${BOLD}USAGE${NC}
     wt                  Auto-detect repo from \$PWD
@@ -1042,14 +1596,14 @@ ${BOLD}ICONS${NC}
     🔒  Locked
 
 ${BOLD}SHELL INTEGRATION${NC}
-    Source the zsh wrapper for cd support:
-        source /path/to/share/wt/wt.zsh
+    Source the wrapper for your shell for cd support:
+        source /path/to/share/wt/wt.zsh   # zsh
+        source /path/to/share/wt/wt.bash  # bash
 
 ${BOLD}REQUIREMENTS${NC}
     git                 Required
     fzf (0.38+)         Required (uses become())
-
-EOF
+"
 }
 
 show_version() {
@@ -1061,10 +1615,28 @@ show_version() {
 # =============================================================================
 
 launch_fzf() {
-    command -v fzf >/dev/null 2>&1 \
-        || die "fzf is required but not installed. Install with: brew install fzf"
+    require_command fzf "the interactive dashboard"
 
     local editor="${EDITOR:-vim}"
+    local preview_window
+    preview_window=$(choose_preview_window)
+    local fzf_help
+    local supports_listen=false supports_list_label=false
+    local session_dir="" socket_path="" activity_file="" token_file=""
+    local async_refresh_cmd="" async_pid=""
+    local -a listen_args=() track_args=() list_label_args=()
+    local list_label="worktrees · branch/state"
+
+    # Progressive enhancement:
+    # - Older fzf versions still get the fast list and lazy preview.
+    # - Newer fzf versions unlock background reloads (--listen) and visible
+    #   list-state labels (--list-label).
+    #
+    # We feature-detect from `fzf --help` instead of assuming the newest flags
+    # exist, because wt still aims to run on older machines.
+    fzf_help=$(fzf --help 2>/dev/null || true)
+    grep -Fq -- "--listen" <<< "$fzf_help" && supports_listen=true
+    grep -Fq -- "--list-label" <<< "$fzf_help" && supports_list_label=true
 
     # Shell-escape script/repo paths for safe embedding in fzf command strings.
     # fzf placeholder fields like {1} are already substituted as shell-quoted
@@ -1080,18 +1652,50 @@ launch_fzf() {
         delete_cmd="$delete_cmd $repo_q"
     fi
 
-    # Parse worktrees to compute common prefix for the header
+    # Async enrichment is optional. If curl is available and fzf supports a
+    # local listen socket, we let fzf start with the cheap list immediately,
+    # then reload the richer activity-sorted list after a background worker
+    # finishes building it.
+    if command -v curl >/dev/null 2>&1 && $supports_listen; then
+        session_dir=$(mktemp -d "${TMPDIR:-/tmp}/wt.XXXXXXXX") || session_dir=""
+        if [[ -n "$session_dir" ]]; then
+            socket_path="$session_dir/fzf.sock"
+            activity_file="$session_dir/activity.list"
+            token_file="$session_dir/refresh.token"
+            # These values are injected into fzf execute/reload strings, so
+            # quote them once up front instead of hoping the temp directory has
+            # no spaces or special shell characters.
+            local socket_q activity_q token_q
+            socket_q=$(printf '%q' "$socket_path")
+            activity_q=$(printf '%q' "$activity_file")
+            token_q=$(printf '%q' "$token_file")
+            listen_args+=("--listen=$socket_path")
+            track_args+=("--track")
+            if $supports_list_label; then
+                list_label="worktrees · loading activity..."
+                async_refresh_cmd="WT_CAN_CHANGE_LIST_LABEL=1 "
+            else
+                async_refresh_cmd=""
+            fi
+            async_refresh_cmd+="$self_q --action-start-async-refresh $socket_q $activity_q $token_q"
+            if [[ -n "${REPO_PATH:-}" ]]; then
+                async_refresh_cmd="$async_refresh_cmd $repo_q"
+            fi
+        fi
+    fi
+    if $supports_list_label; then
+        list_label_args+=("--list-label=$list_label")
+    fi
+
+    # Parse once up front so the header can show the default worktree base path.
+    # The list itself will re-parse inside --list, but that extra porcelain
+    # parse is cheap. The expensive work now lives in the lazy preview path.
     parse_worktrees
     local base_display=""
-    if (( ${#WT_PATHS[@]} > 1 )); then
-        local _prefix="${WT_PATHS[0]}"
-        local _j
-        for (( _j = 1; _j < ${#WT_PATHS[@]}; _j++ )); do
-            while [[ "${WT_PATHS[$_j]}" != "$_prefix"* ]]; do
-                _prefix="${_prefix%/*}"
-            done
-        done
-        [[ -n "$_prefix" ]] && base_display="$(shorten_path "$_prefix")"
+    base_display=$(worktree_base_dir)
+    if [[ -n "$base_display" ]]; then
+        [[ "$base_display" != "/" ]] && base_display="${base_display%/}"
+        base_display="$(shorten_path "$base_display")"
     fi
 
     local list
@@ -1105,28 +1709,53 @@ launch_fzf() {
     [[ -n "$base_display" ]] && header="  ${base_display}"$'\n'
     header+="  enter:cd  ^o:editor  ^p:pull  ^n:new  ^x:delete  ^r:refresh  ^/:preview"
 
+    if [[ -n "$async_refresh_cmd" ]]; then
+        if $supports_list_label; then
+            WT_CAN_CHANGE_LIST_LABEL=1 "$SELF" --action-start-async-refresh "$socket_path" "$activity_file" "$token_file" "${REPO_PATH:-}" \
+                >/dev/null 2>&1 &
+        else
+            "$SELF" --action-start-async-refresh "$socket_path" "$activity_file" "$token_file" "${REPO_PATH:-}" \
+                >/dev/null 2>&1 &
+        fi
+        async_pid=$!
+    fi
+
     local result
-    result=$(echo "$list" | fzf \
+    # printf is intentional here:
+    # - echo has implementation-specific edge cases
+    # - the list payload is already complete text
+    # - printf keeps the startup path boring and predictable
+    result=$(printf '%s\n' "$list" | fzf \
         --ansi \
         --delimiter=$'\x1f' \
         --with-nth=2 \
+        "${listen_args[@]}" \
+        "${track_args[@]}" \
         --preview="$self_q --preview {1}" \
-        --preview-window=right:50%:wrap \
+        --preview-window="$preview_window" \
         --header="$header" \
         --header-first \
+        "${list_label_args[@]}" \
         --reverse \
         --no-sort \
         --no-multi \
         --bind="enter:become(echo {1})" \
         --bind="ctrl-o:execute($editor {1})" \
-        --bind="ctrl-p:execute(git -C {1} pull --ff-only)+reload($list_cmd)" \
-        --bind="ctrl-r:reload($list_cmd)" \
-        --bind="ctrl-n:execute($self_q --action-new {1} </dev/tty >/dev/tty 2>&1)+reload($list_cmd)" \
-        --bind="ctrl-x:execute($delete_cmd </dev/tty >/dev/tty 2>&1)+reload($list_cmd)" \
+        --bind="ctrl-p:execute(git -C {1} pull --ff-only)+reload($list_cmd)${async_refresh_cmd:+}+execute-silent($async_refresh_cmd >/dev/null 2>&1 &)" \
+        --bind="ctrl-r:reload($list_cmd)${async_refresh_cmd:+}+execute-silent($async_refresh_cmd >/dev/null 2>&1 &)" \
+        --bind="ctrl-n:execute($self_q --action-new {1} </dev/tty >/dev/tty 2>&1)+reload($list_cmd)${async_refresh_cmd:+}+execute-silent($async_refresh_cmd >/dev/null 2>&1 &)" \
+        --bind="ctrl-x:execute($delete_cmd </dev/tty >/dev/tty 2>&1)+reload($list_cmd)${async_refresh_cmd:+}+execute-silent($async_refresh_cmd >/dev/null 2>&1 &)" \
         --bind="ctrl-/:toggle-preview" \
         --pointer="▶" \
         --prompt="worktree▶ " \
     ) || true
+
+    if [[ -n "$async_pid" ]]; then
+        kill "$async_pid" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$session_dir" ]]; then
+        rm -rf "$session_dir"
+    fi
 
     # Output result (path for cd wrapper, or empty on escape)
     if [[ -n "$result" ]]; then
@@ -1159,12 +1788,25 @@ main() {
             cmd_list
             return 0
             ;;
+        --list-activity)
+            REPO_PATH="${2:-}"
+            cmd_list_activity
+            return 0
+            ;;
         --action-new)
             action_new "${2:?Missing worktree path for --action-new}"
             return 0
             ;;
         --action-delete)
             action_delete "${2:?Missing worktree path for --action-delete}" "${3:-}"
+            return 0
+            ;;
+        --action-start-async-refresh)
+            start_async_refresh "${2:?Missing fzf socket path}" "${3:?Missing activity output path}" "${4:?Missing refresh token file}" "${5:-}"
+            return 0
+            ;;
+        --action-async-refresh)
+            action_async_refresh "${2:?Missing fzf socket path}" "${3:?Missing activity output path}" "${4:?Missing refresh token file}" "${5:?Missing refresh token}" "${6:-}"
             return 0
             ;;
         -*)
@@ -1174,6 +1816,11 @@ main() {
             REPO_PATH="${1:-}"
             ;;
     esac
+
+    # Help and version are intentionally handled above without requiring Git.
+    # Everything below this point either inspects a repository or launches the
+    # dashboard, so Git is a real hard dependency from here on.
+    require_command git "repository inspection"
 
     # Verify we're in a git repository
     if [[ -n "$REPO_PATH" ]]; then
