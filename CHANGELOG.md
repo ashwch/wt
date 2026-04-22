@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Added always-on multi-selection with stable path identity and bulk-safe dispatch for pull and delete/prune
+- Added a selection-aware preview mode that makes bulk targets explicit when focus and selection diverge
+- Added richer documentation for the selection model, deferred refresh behavior, and row-state rendering
+
+### Changed
+- Changed the dashboard to treat `Space`, `Tab`, and `Shift-Tab` as first-class selection workflows
+- Changed the left state column to a custom-rendered `□` / `■` selection cell instead of stacked native fzf pointer/marker glyphs
+- Changed async activity refresh to defer list replacement while a selection exists and apply it after selection clears
+- Changed the stacked preview layout to give the lower selection summary pane more room by default
+
+### Fixed
+- Fixed launch-time `fzf` option breakage caused by inline comments inside a backslash-continued command
+- Fixed selected `Ctrl-P` / `Ctrl-X` execution so bulk actions reliably run from the live dashboard
+- Fixed rendered selection-state handling across macOS `/bin/bash`, canonicalized `/tmp` vs `/private/tmp` paths, and focused-row redraws
+- Fixed bulk delete so a worktree that becomes dirty after batch confirmation is re-prompted before force removal
+
 ## [0.2.0] - 2026-04-13
 
 ### Added

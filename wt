@@ -41,11 +41,15 @@ readonly SELF
 # Colors
 readonly RED=$'\033[31m'
 readonly GREEN=$'\033[32m'
-readonly BLUE=$'\033[34m'
 readonly YELLOW=$'\033[33m'
 readonly DIM=$'\033[2m'
 readonly BOLD=$'\033[1m'
 readonly NC=$'\033[0m'
+readonly FZF_FIELD_SEPARATOR=$'\x1f'
+# Custom per-row state glyphs. These live in the rendered row text rather than
+# fzf's native pointer/marker columns so each row shows exactly one state cell.
+readonly WT_STATE_EMPTY="□"
+readonly WT_STATE_SELECTED="■"
 
 # =============================================================================
 # Utility Functions
@@ -148,6 +152,14 @@ require_command() {
     fi
 
     die "$cmd is required. Install it with: $hint"
+}
+
+shell_join() {
+    local parts=() arg
+    for arg in "$@"; do
+        parts+=("$(printf '%q' "$arg")")
+    done
+    printf '%s' "${parts[*]}"
 }
 
 # A stale worktree cannot prune itself because its directory is already gone.
@@ -451,6 +463,14 @@ terminal_lines() {
     echo "$lines"
 }
 
+preview_lines() {
+    local lines="${FZF_PREVIEW_LINES:-}"
+    if [[ ! "$lines" =~ ^[0-9]+$ ]] || (( lines <= 0 )); then
+        lines=$(terminal_lines)
+    fi
+    echo "$lines"
+}
+
 preview_columns() {
     local cols="${FZF_PREVIEW_COLUMNS:-}"
     # When fzf runs a preview command it tells us the actual preview width via
@@ -492,9 +512,9 @@ choose_preview_window() {
     elif (( cols >= 120 && cols >= lines * 3 / 2 )); then
         echo "right,50%,wrap"
     elif (( lines >= 40 )); then
-        echo "down,45%,wrap"
-    else
         echo "down,55%,wrap"
+    else
+        echo "down,62%,wrap"
     fi
 }
 
@@ -670,6 +690,359 @@ ensure_repo_context() {
     fi
 }
 
+# =============================================================================
+# Selection Model
+# =============================================================================
+#
+# The dashboard now has three targeting states:
+#
+#   focus      No active selection. Actions target the focused row.
+#   selection  One or more selected rows. Actions target the selected set.
+#   none       No active selection and no focused match (e.g. query has 0 hits).
+#
+# Why make this explicit:
+# - The old dashboard was always "focus".
+# - Always-on multi-select introduces a real second target mode.
+# - fzf can also hand us an empty {1} placeholder when there is no focused
+#   match, which is different from both of the cases above.
+#
+# The helpers below keep that state machine in one place so preview, pull,
+# delete, and refresh all answer the same first-principles question:
+#
+#   "What is the intended target set right now?"
+#
+selection_count() {
+    local count="${FZF_SELECT_COUNT:-0}"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    printf '%s\n' "$count"
+}
+
+selection_active() {
+    local count
+    count=$(selection_count)
+    (( count > 0 ))
+}
+
+focused_path_from_placeholder() {
+    local current_path="${1:-}"
+    [[ -n "$current_path" ]] || return 1
+    canonical_path "$current_path"
+}
+
+file_sha256() {
+    local file="$1"
+
+    # Keep the render-signature path portable across macOS, Linux, and WSL.
+    # Different machines ship different hashing tools by default, but the
+    # renderer only needs a stable content hash, not a specific implementation.
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$file" | awk '{print $NF}'
+    else
+        die "wt needs sha256sum, shasum, or openssl for rendered list state tracking"
+    fi
+}
+
+first_path_from_list_file() {
+    local list_file="$1"
+    local row path=""
+
+    [[ -f "$list_file" ]] || return 1
+    IFS= read -r row < "$list_file" || return 1
+    [[ -n "$row" ]] || return 1
+
+    path="${row%%"$FZF_FIELD_SEPARATOR"*}"
+    [[ -n "$path" ]] || return 1
+    canonical_path "$path"
+}
+
+path_from_list_row() {
+    local row="$1"
+    local path="${row%%"$FZF_FIELD_SEPARATOR"*}"
+    canonical_path "$path"
+}
+
+selected_paths_from_file() {
+    local selected_file="$1"
+    SELECTED_PATHS=()
+
+    [[ -n "$selected_file" && -f "$selected_file" ]] || return 0
+
+    local row path
+    while IFS= read -r row || [[ -n "$row" ]]; do
+        [[ -n "$row" ]] || continue
+        path=$(path_from_list_row "$row")
+        [[ -n "$path" ]] && SELECTED_PATHS+=("$path")
+    done < "$selected_file"
+}
+
+state_glyph_for_path() {
+    local row_path="$1"
+
+    if (( ${#SELECTED_PATHS[@]} > 0 )) && array_contains_path "$row_path" "${SELECTED_PATHS[@]}"; then
+        printf '%s' "$WT_STATE_SELECTED"
+    else
+        printf '%s' "$WT_STATE_EMPTY"
+    fi
+}
+
+render_list_file_for_state() {
+    local source_file="$1" rendered_file="$2" selected_file="${3:-}" current_path="${4:-}"
+    local row row_path body state
+
+    SELECTED_PATHS=()
+    if selection_active; then
+        selected_paths_from_file "$selected_file"
+    fi
+
+    : > "$rendered_file"
+    while IFS= read -r row || [[ -n "$row" ]]; do
+        [[ -n "$row" ]] || continue
+        row_path=$(path_from_list_row "$row")
+        body="${row#*"$FZF_FIELD_SEPARATOR"}"
+        state=$(state_glyph_for_path "$row_path")
+        printf '%s%s%s %s\n' "$row_path" "$FZF_FIELD_SEPARATOR" "$state" "$body" >> "$rendered_file"
+    done < "$source_file"
+}
+
+render_signature() {
+    local source_file="$1" selected_file="${2:-}" current_path="${3:-}"
+    local selected_hash
+
+    if selection_active && [[ -f "$selected_file" ]]; then
+        selected_hash=$(file_sha256 "$selected_file")
+    else
+        selected_hash="no-selection"
+    fi
+
+    printf '%s|%s|%s\n' \
+        "$(file_sha256 "$source_file")" \
+        "$selected_hash" \
+        "state-column-v2"
+}
+
+render_list_if_needed() {
+    local source_file="$1" rendered_file="$2" signature_file="$3" selected_file="${4:-}" current_path="${5:-}"
+    local signature previous_signature=""
+
+    signature=$(render_signature "$source_file" "$selected_file" "$current_path")
+    [[ -f "$signature_file" ]] && previous_signature=$(cat "$signature_file" 2>/dev/null || true)
+
+    if [[ "$signature" == "$previous_signature" && -f "$rendered_file" ]]; then
+        return 1
+    fi
+
+    render_list_file_for_state "$source_file" "$rendered_file" "$selected_file" "$current_path"
+    printf '%s' "$signature" > "$signature_file"
+    return 0
+}
+
+# Convert fzf's placeholders into one normalized target set.
+#
+# Why this exists:
+# - {1} is only meaningful for the focused row.
+# - {+f} is the only bulk-safe way to receive selected rows at scale.
+# - future code should not need to remember those transport details.
+#
+# Result:
+# - ACTION_TARGET_MODE tells callers *which* UX mode they are in
+# - ACTION_TARGETS tells callers *which paths* they should operate on
+resolve_action_targets() {
+    local selected_file="$1" current_path="$2"
+    local focused_path=""
+    ACTION_TARGET_MODE="focus"
+    ACTION_TARGETS=()
+
+    if selection_active; then
+        ACTION_TARGET_MODE="selection"
+        selected_paths_from_file "$selected_file"
+        if (( ${#SELECTED_PATHS[@]} > 0 )); then
+            ACTION_TARGETS=("${SELECTED_PATHS[@]}")
+        fi
+    else
+        if focused_path=$(focused_path_from_placeholder "$current_path"); then
+            ACTION_TARGETS=("$focused_path")
+        else
+            ACTION_TARGET_MODE="none"
+        fi
+    fi
+}
+
+resolve_action_targets_for_mode() {
+    local target_mode="${1:?Missing target mode}" selected_file="$2" current_path="$3"
+    local focused_path=""
+    ACTION_TARGET_MODE="$target_mode"
+    ACTION_TARGETS=()
+
+    case "$target_mode" in
+        selection)
+            selected_paths_from_file "$selected_file"
+            if (( ${#SELECTED_PATHS[@]} > 0 )); then
+                ACTION_TARGETS=("${SELECTED_PATHS[@]}")
+            else
+                ACTION_TARGET_MODE="none"
+            fi
+            ;;
+        focus)
+            if focused_path=$(focused_path_from_placeholder "$current_path"); then
+                ACTION_TARGETS=("$focused_path")
+            else
+                ACTION_TARGET_MODE="none"
+            fi
+            ;;
+        none)
+            ACTION_TARGETS=()
+            ;;
+        *)
+            die "Unknown target mode: $target_mode"
+            ;;
+    esac
+}
+
+build_wt_render_reload_command() {
+    local source_file="$1" rendered_file="$2" signature_file="$3" selected_file="$4" current_path="$5"
+    shell_join "$SELF" --rendered-list-from-source "$source_file" "$rendered_file" "$signature_file" "$selected_file" "$current_path"
+}
+
+# launch_fzf builds action strings for fzf, but the real branching logic lives
+# in shell subcommands. That keeps the bind table readable and lets future
+# readers debug a dispatcher directly from the terminal.
+#
+# Example:
+#   ./wt --dispatch-pull /tmp/selected-rows /path/to/focus
+#   FZF_SELECT_COUNT=2 ./wt --action-pull /tmp/selected-rows /path/to/focus
+build_wt_async_refresh_command() {
+    local socket_path="$1" activity_file="$2" token_file="$3" pid_file="$4" pending_file="$5" source_file="$6" rendered_file="$7" signature_file="$8" repo_path="${9:-}"
+    local -a parts=()
+
+    if [[ -n "${WT_CAN_CHANGE_LIST_LABEL:-}" ]]; then
+        parts=("env" "WT_CAN_CHANGE_LIST_LABEL=1" "$SELF" "--action-start-async-refresh" "$socket_path" "$activity_file" "$token_file" "$pid_file" "$pending_file" "$source_file" "$rendered_file" "$signature_file")
+    else
+        parts=("$SELF" "--action-start-async-refresh" "$socket_path" "$activity_file" "$token_file" "$pid_file" "$pending_file" "$source_file" "$rendered_file" "$signature_file")
+    fi
+
+    [[ -n "$repo_path" ]] && parts+=("$repo_path")
+    shell_join "${parts[@]}"
+}
+
+emit_tty_execute_action() {
+    local cmd
+    cmd=$(shell_join "$@")
+    printf 'execute(%s </dev/tty >/dev/tty 2>&1)' "$cmd"
+}
+
+emit_become_action() {
+    local cmd
+    cmd=$(shell_join "$@")
+    printf 'become(%s)' "$cmd"
+}
+
+emit_reload_actions() {
+    local repo_path="${1:-}" socket_path="${2:-}" activity_file="${3:-}" token_file="${4:-}" pid_file="${5:-}" pending_file="${6:-}" source_file="${7:-}" rendered_file="${8:-}" signature_file="${9:-}" selected_file="${10:-}" current_path="${11:-}"
+
+    # reload-sync is intentional here:
+    # - plain reload(...) can drop active selections mid-stream
+    # - reload-sync(...) gives fzf a complete replacement list at once
+    # - field-1 identity tracking can then preserve the focused row and
+    #   selected rows without guesswork
+    printf 'reload-sync(%s)' \
+        "$(shell_join "$SELF" --rendered-list-refresh "$source_file" "$rendered_file" "$signature_file" "$selected_file" "$current_path" "$repo_path")"
+
+    if [[ -n "$socket_path" && -n "$activity_file" && -n "$token_file" && -n "$pid_file" && -n "$pending_file" ]]; then
+        printf '+execute-silent(%s >/dev/null 2>&1 &)' \
+            "$(build_wt_async_refresh_command "$socket_path" "$activity_file" "$token_file" "$pid_file" "$pending_file" "$source_file" "$rendered_file" "$signature_file" "$repo_path")"
+    fi
+}
+
+fzf_state_json() {
+    local socket_path="$1"
+    curl --silent --show-error --unix-socket "$socket_path" http://localhost/ 2>/dev/null || true
+}
+
+# We ask the running fzf instance whether a selection exists before applying an
+# async activity refresh.
+#
+# First principles:
+# - selection trust matters more than refreshing the list a fraction earlier
+# - a background reorder while the user is building a selected set feels wrong
+# - the listen socket already exposes the current selection state, so use it
+fzf_has_active_selection() {
+    local socket_path="$1"
+    local state
+    state=$(fzf_state_json "$socket_path")
+    [[ -n "$state" && "$state" != *'"selected":[]'* ]]
+}
+
+emit_activity_reload_actions() {
+    local source_file="$1" rendered_file="$2" signature_file="$3" selected_file="$4" current_path="$5"
+    local activity_cmd
+    activity_cmd=$(build_wt_render_reload_command "$source_file" "$rendered_file" "$signature_file" "$selected_file" "$current_path")
+
+    if [[ -n "${WT_CAN_CHANGE_LIST_LABEL:-}" ]]; then
+        printf 'reload-sync(%s)+change-list-label(worktrees · latest activity)' \
+            "$activity_cmd"
+    else
+        printf 'reload-sync(%s)' \
+            "$activity_cmd"
+    fi
+}
+
+# Keep the info line simple and task-shaped:
+# - zero selection: remind the user how to start selecting
+# - active selection: remind the user which actions remain valid
+info_state() {
+    local info="${FZF_INFO:-}"
+    local count
+    count=$(selection_count)
+
+    if (( count > 0 )); then
+        printf '%s · %s selected · ^p pull · ^x delete/prune · enter/^o/^n/^r blocked\n' "$info" "$count"
+    else
+        printf '%s · space/tab/shift-tab select multiple\n' "$info"
+    fi
+}
+
+# When async activity data finishes while selection is active, the worker writes
+# a tiny "pending refresh" marker instead of reloading immediately.
+#
+# The selection-change dispatcher is the place where we cash that marker in.
+# That means the list only upgrades after the user leaves selection mode, which
+# preserves trust without throwing away the faster background work.
+dispatch_selection_change() {
+    local activity_file="${1:-}" pending_file="${2:-}" source_file="${3:-}" rendered_file="${4:-}" signature_file="${5:-}" selected_file="${6:-}" current_path="${7:-}"
+
+    if selection_active; then
+        dispatch_render_state "$source_file" "$rendered_file" "$signature_file" "$selected_file" "$current_path"
+        return 0
+    fi
+
+    if [[ -z "$pending_file" || ! -s "$pending_file" || -z "$activity_file" || ! -f "$activity_file" ]]; then
+        dispatch_render_state "$source_file" "$rendered_file" "$signature_file" "$selected_file" "$current_path"
+        return 0
+    fi
+
+    cp -f "$activity_file" "$source_file"
+    rm -f "$pending_file"
+    emit_activity_reload_actions "$source_file" "$rendered_file" "$signature_file" "$selected_file" "$current_path"
+}
+
+dispatch_render_state() {
+    local source_file="${1:?Missing source list file}"
+    local rendered_file="${2:?Missing rendered list file}"
+    local signature_file="${3:?Missing render signature file}"
+    local selected_file="${4:-}"
+    local current_path="${5:-}"
+
+    if ! render_list_if_needed "$source_file" "$rendered_file" "$signature_file" "$selected_file" "$current_path"; then
+        return 0
+    fi
+
+    printf 'reload-sync(%s)' "$(shell_join cat "$rendered_file")"
+}
+
 activity_row_payload() {
     local wt_path="$1" fallback="$2" now="$3"
     ACTIVITY_ROW_TS=0
@@ -692,13 +1065,41 @@ activity_row_payload() {
     fi
 }
 
+rendered_list_from_source() {
+    local source_file="${1:?Missing source list file}"
+    local rendered_file="${2:?Missing rendered list file}"
+    local signature_file="${3:?Missing render signature file}"
+    local selected_file="${4:-}"
+    local current_path="${5:-}"
+
+    render_list_if_needed "$source_file" "$rendered_file" "$signature_file" "$selected_file" "$current_path" || true
+    cat "$rendered_file"
+}
+
+rendered_list_refresh() {
+    local source_file="${1:?Missing source list file}"
+    local rendered_file="${2:?Missing rendered list file}"
+    local signature_file="${3:?Missing render signature file}"
+    local selected_file="${4:-}"
+    local current_path="${5:-}"
+    REPO_PATH="${6:-}"
+
+    cmd_list > "$source_file"
+    render_list_if_needed "$source_file" "$rendered_file" "$signature_file" "$selected_file" "$current_path" || true
+    cat "$rendered_file"
+}
+
 # =============================================================================
 # List Command
 # =============================================================================
 
 # Outputs tab-delimited rows for fzf using only cheap worktree metadata.
 # Field 1 (hidden): full worktree path
-# Field 2 (visible): icon, worktree path, branch/state label
+# Field 2 (hidden-to-renderer): row body without the custom left state cell
+#
+# The actual visible list shown in fzf is derived from this base file plus the
+# current focus/selection state. That lets us render exactly one state glyph
+# per row instead of fighting fzf's separate pointer/marker columns.
 cmd_list() {
     require_command git "worktree inspection"
     ensure_repo_context
@@ -722,26 +1123,28 @@ cmd_list() {
         local path="${WT_PATHS[$i]}"
         local state="${WT_STATES[$i]}"
 
-        # Determine icon and color — current worktree takes priority
-        local icon color is_current=false
+        # The leftmost state cell already encodes selection. Do not add a
+        # second icon language in the row body as well; it reads as random
+        # clutter. The row body now uses color + the dim label only.
+        local color is_current=false
 
         if [[ -n "$current_wt" && ( "$current_wt" == "$path" || "$current_wt" == "$path/"* ) ]]; then
             is_current=true
         fi
 
         if $is_current; then
-            icon="●" color="$GREEN"
+            color="$GREEN"
         else
             case "$state" in
-                prunable)  icon="✗" color="$RED" ;;
-                detached)  icon="◌" color="$YELLOW" ;;
-                *)         icon="○" color="$BLUE" ;;
+                prunable)  color="$RED" ;;
+                detached)  color="$YELLOW" ;;
+                *)         color="$NC" ;;
             esac
         fi
 
-        # Locked worktrees override the icon
+        # Locked worktrees override the color
         if [[ -n "${WT_LOCKED[$i]}" ]]; then
-            icon="🔒" color="$DIM"
+            color="$DIM"
         fi
 
         # The visible row puts the path before commit text on purpose.
@@ -772,9 +1175,9 @@ cmd_list() {
 
         # Collect: group\x1fpath_sort_key\x1fformatted_row
         local row
-        row=$(printf "%s\x1f %s%s %-30s%s  %s%s%s" \
+        row=$(printf "%s\x1f%s%-30s%s  %s%s%s" \
             "$path" \
-            "$color" "$icon" "$display_path" "$NC" \
+            "$color" "$display_path" "$NC" \
             "$DIM" "$label" "$NC")
 
         rows+=("${sort_group}"$'\x1f'"${sort_path}"$'\x1f'"${row}")
@@ -806,23 +1209,23 @@ cmd_list_activity() {
         local path="${WT_PATHS[$i]}"
         local state="${WT_STATES[$i]}"
 
-        local icon color is_current=false
+        local color is_current=false
         if [[ -n "$current_wt" && ( "$current_wt" == "$path" || "$current_wt" == "$path/"* ) ]]; then
             is_current=true
         fi
 
         if $is_current; then
-            icon="●" color="$GREEN"
+            color="$GREEN"
         else
             case "$state" in
-                prunable)  icon="✗" color="$RED" ;;
-                detached)  icon="◌" color="$YELLOW" ;;
-                *)         icon="○" color="$BLUE" ;;
+                prunable)  color="$RED" ;;
+                detached)  color="$YELLOW" ;;
+                *)         color="$NC" ;;
             esac
         fi
 
         if [[ -n "${WT_LOCKED[$i]}" ]]; then
-            icon="🔒" color="$DIM"
+            color="$DIM"
         fi
 
         local sort_path display_path
@@ -843,9 +1246,9 @@ cmd_list_activity() {
         subject=$(truncate_str "$ACTIVITY_ROW_SUBJECT" 52)
 
         local row
-        row=$(printf "%s\x1f %s%s %-30s%s  %s%-8s%s  %s" \
+        row=$(printf "%s\x1f%s%-30s%s  %s%-8s%s  %s" \
             "$path" \
-            "$color" "$icon" "$display_path" "$NC" \
+            "$color" "$display_path" "$NC" \
             "$DIM" "$age" "$NC" \
             "$subject")
 
@@ -998,7 +1401,11 @@ start_async_refresh() {
     local output_path="${2:?Missing activity output path}"
     local token_file="${3:?Missing refresh token file}"
     local pid_file="${4:?Missing refresh pid file}"
-    local repo_path="${5:-}"
+    local pending_file="${5:?Missing pending refresh file}"
+    local source_file="${6:?Missing source list file}"
+    local rendered_file="${7:?Missing rendered list file}"
+    local signature_file="${8:?Missing render signature file}"
+    local repo_path="${9:-}"
     local token old_pid=""
 
     command -v curl >/dev/null 2>&1 || return 0
@@ -1021,10 +1428,15 @@ start_async_refresh() {
         post_fzf_action "$socket_path" "change-list-label(worktrees · loading activity...)" || true
     fi
 
+    # A new refresh invalidates any older "ready but deferred" activity list.
+    # Otherwise an old pending marker could land after a newer worker finishes
+    # and make the list jump to stale activity ordering later.
+    rm -f "$pending_file"
+
     # Run the refresh worker in this process. Callers decide whether this
     # launcher should run in the background, which keeps the tracked PID tied to
     # the real worker rather than a short-lived intermediate shell.
-    "$SELF" --action-async-refresh "$socket_path" "$output_path" "$token_file" "$token" "$repo_path" \
+    "$SELF" --action-async-refresh "$socket_path" "$output_path" "$token_file" "$token" "$pending_file" "$source_file" "$rendered_file" "$signature_file" "$repo_path" \
         >/dev/null 2>&1
 }
 
@@ -1040,9 +1452,11 @@ action_async_refresh() {
     local output_path="${2:?Missing activity output path}"
     local token_file="${3:?Missing refresh token file}"
     local expected_token="${4:?Missing refresh token}"
-    REPO_PATH="${5:-}"
-    local output_q
-
+    local pending_file="${5:?Missing pending refresh file}"
+    local source_file="${6:?Missing source list file}"
+    local rendered_file="${7:?Missing rendered list file}"
+    local signature_file="${8:?Missing render signature file}"
+    REPO_PATH="${9:-}"
     require_command git "worktree activity refresh"
     command -v curl >/dev/null 2>&1 || return 0
 
@@ -1058,17 +1472,32 @@ action_async_refresh() {
     [[ "$(cat "$token_file" 2>/dev/null)" == "$expected_token" ]] || { rm -f "$tmp_output"; return 0; }
 
     mv -f "$tmp_output" "$output_path"
-    # fzf evaluates reload(...) as a shell command. The temp path comes from
-    # mktemp and may live under a TMPDIR with spaces, so quote it before
-    # sending it across the socket.
-    output_q=$(printf '%q' "$output_path")
+
+    # Separate "compute the richer list" from "apply the richer list".
+    #
+    # Why:
+    # - computing it in the background keeps startup fast
+    # - applying it immediately can still be the wrong UX when selection is
+    #   active, because the list may reorder while the user is building a set
+    if fzf_has_active_selection "$socket_path"; then
+        printf 'ready\n' > "$pending_file"
+        if [[ -n "${WT_CAN_CHANGE_LIST_LABEL:-}" ]]; then
+            post_fzf_action "$socket_path" "change-list-label(worktrees · activity ready)" || true
+        fi
+        return 0
+    fi
+
+    cp -f "$output_path" "$source_file"
+    rm -f "$pending_file"
+    render_list_if_needed "$source_file" "$rendered_file" "$signature_file" "" "" || true
 
     # Ask fzf to keep tracking the current item if possible, then replace the
-    # fast list with the enriched activity-sorted list.
+    # fast list with the enriched activity-sorted list. We use reload-sync so
+    # identity-based selection preservation stays intact under always-on multi.
     if [[ -n "${WT_CAN_CHANGE_LIST_LABEL:-}" ]]; then
-        post_fzf_action "$socket_path" "track-current+reload(cat $output_q)+change-list-label(worktrees · latest activity)" || true
+        post_fzf_action "$socket_path" "track-current+reload-sync(cat $(printf '%q' "$rendered_file"))+change-list-label(worktrees · latest activity)" || true
     else
-        post_fzf_action "$socket_path" "track-current+reload(cat $output_q)" || true
+        post_fzf_action "$socket_path" "track-current+reload-sync(cat $(printf '%q' "$rendered_file"))" || true
     fi
 }
 
@@ -1297,9 +1726,159 @@ cmd_preview() {
     fi
 }
 
+array_contains_path() {
+    local needle="$1" item
+    shift
+
+    for item in "$@"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+
+    return 1
+}
+
+# Preview has the same three targeting states as actions:
+#
+#   focus      Show the existing rich per-worktree preview.
+#   selection  Show which selected paths will actually be acted on.
+#   none       Explain that the query currently has no focused match.
+#
+# This is the guardrail that stops preview from lying when the cursor and the
+# action target diverge under always-on multi-select.
+cmd_preview_dispatch() {
+    local selected_file="${1:?Missing selected rows file}"
+    local current_path="${2-}"
+    local focused_path=""
+
+    focused_path=$(focused_path_from_placeholder "$current_path" 2>/dev/null || true)
+    resolve_action_targets "$selected_file" "$focused_path"
+
+    if [[ "$ACTION_TARGET_MODE" != "selection" ]]; then
+        if [[ -z "$focused_path" ]]; then
+            echo "${DIM}No matching worktrees.${NC}"
+            return
+        fi
+        cmd_preview "$focused_path"
+        return
+    fi
+
+    if (( ${#ACTION_TARGETS[@]} == 1 )); then
+        local target_path="${ACTION_TARGETS[0]}"
+
+        echo "${BOLD}Selection target${NC}"
+        echo "  $(shorten_path "$target_path")"
+        if [[ -n "$focused_path" && "$target_path" != "$focused_path" ]]; then
+            echo "  ${DIM}Cursor is on $(shorten_path "$focused_path"), but actions target the selected row.${NC}"
+        elif [[ -z "$focused_path" ]]; then
+            echo "  ${DIM}Selection remains active even though the current query has no focused match.${NC}"
+        fi
+
+        cmd_preview "$target_path"
+        return
+    fi
+
+    echo "${BOLD}${#ACTION_TARGETS[@]} worktrees selected${NC}"
+    echo "  ${DIM}Bulk actions target this selected set.${NC}"
+    echo "  ${DIM}Ctrl-P pulls all selected worktrees. Ctrl-X deletes/prunes all selected worktrees.${NC}"
+    echo "  ${DIM}Enter, Ctrl-O, Ctrl-N, and Ctrl-R stay disabled until selection clears.${NC}"
+
+    if [[ -z "$focused_path" ]]; then
+        echo "  ${DIM}Selection remains active even though the current query has no focused match.${NC}"
+    elif ! array_contains_path "$focused_path" "${ACTION_TARGETS[@]}"; then
+        echo "  ${DIM}Cursor is on $(shorten_path "$focused_path"), which is outside the active target set.${NC}"
+    fi
+
+    echo ""
+    local lines reserve_lines max_items i path
+    lines=$(preview_lines)
+    reserve_lines=8
+    max_items=$(( lines - reserve_lines ))
+    (( max_items < 8 )) && max_items=8
+
+    for (( i = 0; i < ${#ACTION_TARGETS[@]} && i < max_items; i++ )); do
+        path="${ACTION_TARGETS[$i]}"
+        printf '  %s %s\n' "•" "$(shorten_path "$path")"
+    done
+
+    if (( ${#ACTION_TARGETS[@]} > max_items )); then
+        echo "  ${DIM}… and $(( ${#ACTION_TARGETS[@]} - max_items )) more${NC}"
+    fi
+}
+
 # =============================================================================
 # Actions (called from fzf keybindings via self-invocation)
 # =============================================================================
+
+action_enter() {
+    local wt_path="${1:-}"
+    [[ -n "$wt_path" ]] || return 1
+    canonical_path "$wt_path"
+}
+
+action_open() {
+    local wt_path="${1:-}"
+    local editor="${EDITOR:-vim}"
+    [[ -n "$wt_path" ]] || return 1
+
+    if [[ "$editor" == *[[:space:]]* ]]; then
+        eval "$editor \"\$wt_path\""
+    else
+        "$editor" "$wt_path"
+    fi
+}
+
+action_pull() {
+    local selected_file="${1:?Missing selected rows file}"
+    local current_path="${2-}"
+    local target_mode="${3:-auto}"
+
+    if [[ "$target_mode" == "auto" ]]; then
+        resolve_action_targets "$selected_file" "$current_path"
+    else
+        resolve_action_targets_for_mode "$target_mode" "$selected_file" "$current_path"
+    fi
+
+    if (( ${#ACTION_TARGETS[@]} == 0 )); then
+        if [[ "$ACTION_TARGET_MODE" == "none" ]]; then
+            echo "${RED}No matching worktree is focused.${NC}"
+        else
+            echo "${RED}No worktrees selected.${NC}"
+        fi
+        return 1
+    fi
+
+    if [[ "$ACTION_TARGET_MODE" != "selection" ]]; then
+        git -C "${ACTION_TARGETS[0]}" pull --ff-only 2>&1
+        return $?
+    fi
+
+    local failures=0 i wt_path short_path
+    echo "${BOLD}Pulling ${#ACTION_TARGETS[@]} selected worktree(s)...${NC}"
+
+    for (( i = 0; i < ${#ACTION_TARGETS[@]}; i++ )); do
+        wt_path="${ACTION_TARGETS[$i]}"
+        short_path=$(shorten_path "$wt_path")
+
+        echo ""
+        echo "${BOLD}[$(( i + 1 ))/${#ACTION_TARGETS[@]}]${NC} $short_path"
+
+        if git -C "$wt_path" pull --ff-only 2>&1; then
+            :
+        else
+            failures=$(( failures + 1 ))
+        fi
+    done
+
+    if (( failures == 0 )); then
+        echo ""
+        echo "${GREEN}✓${NC} Pulled ${#ACTION_TARGETS[@]} worktree(s)"
+        return 0
+    fi
+
+    echo ""
+    echo "${YELLOW}${failures}${NC} pull(s) failed"
+    return 1
+}
 
 action_new() {
     local wt_path="$1"
@@ -1575,6 +2154,503 @@ action_delete() {
     fi
 }
 
+inspect_delete_target() {
+    local wt_path="$1"
+    local preferred_ctx="${2:-}"
+
+    DELETE_WT_PATH=$(canonical_path "$wt_path")
+    DELETE_PREFERRED_CTX="$preferred_ctx"
+    DELETE_SHORT_PATH=$(shorten_path "$DELETE_WT_PATH")
+    DELETE_METADATA_STATE=""
+    DELETE_SKIP_REASON=""
+    DELETE_CLASS=""
+    DELETE_RISKY=false
+    DELETE_IS_DETACHED=false
+    DELETE_IS_LOCKED=false
+    DELETE_BRANCH_NAME=""
+    DELETE_HEAD_SHA=""
+    DELETE_STATUS_OUTPUT=""
+    DELETE_DIRTY_COUNT=0
+    DELETE_MAIN_WT=""
+
+    local state_ctx="${preferred_ctx:-}"
+    if [[ -z "$state_ctx" && -d "$DELETE_WT_PATH" ]]; then
+        state_ctx="$DELETE_WT_PATH"
+    fi
+    if [[ -n "$state_ctx" ]] && ! git -C "$state_ctx" rev-parse --git-dir >/dev/null 2>&1; then
+        state_ctx=""
+    fi
+    if [[ -z "$state_ctx" ]]; then
+        state_ctx=$(find_prune_context "$DELETE_WT_PATH" "$preferred_ctx" 2>/dev/null || true)
+    fi
+    if [[ -n "$state_ctx" ]]; then
+        IFS=$'\t' read -r DELETE_METADATA_STATE _delete_locked <<< "$(worktree_state_from_context "$state_ctx" "$DELETE_WT_PATH" 2>/dev/null || true)"
+    fi
+
+    if [[ "$DELETE_METADATA_STATE" == "prunable" ]]; then
+        DELETE_CLASS="prunable"
+        [[ -e "$DELETE_WT_PATH" ]] && DELETE_RISKY=true
+        return 0
+    fi
+
+    if [[ ! -e "$DELETE_WT_PATH" ]]; then
+        DELETE_CLASS="missing"
+        return 0
+    fi
+
+    if [[ ! -d "$DELETE_WT_PATH" ]]; then
+        DELETE_CLASS="invalid"
+        DELETE_SKIP_REASON="path is not a directory"
+        return 0
+    fi
+
+    if ! worktree_known_to_git_context "$DELETE_WT_PATH" "$DELETE_WT_PATH"; then
+        DELETE_CLASS="invalid"
+        DELETE_SKIP_REASON="not a git worktree"
+        return 0
+    fi
+
+    DELETE_MAIN_WT=$(git -C "$DELETE_WT_PATH" worktree list --porcelain 2>/dev/null | head -1)
+    DELETE_MAIN_WT=$(canonical_path "${DELETE_MAIN_WT#worktree }")
+    if [[ "$DELETE_WT_PATH" == "$DELETE_MAIN_WT" ]]; then
+        DELETE_CLASS="main"
+        DELETE_SKIP_REASON="main worktree"
+        return 0
+    fi
+
+    local current
+    current=$(canonical_path "${PWD:-}")
+    if [[ "$current" == "$DELETE_WT_PATH" || "$current" == "$DELETE_WT_PATH/"* ]]; then
+        DELETE_CLASS="current"
+        DELETE_SKIP_REASON="current worktree"
+        return 0
+    fi
+
+    local in_block=false line
+    while IFS= read -r line; do
+        if [[ "$line" == "worktree "* ]]; then
+            if $in_block; then
+                break
+            fi
+            [[ "${line#worktree }" == "$DELETE_WT_PATH" ]] && in_block=true
+        elif $in_block && [[ "$line" == locked* ]]; then
+            DELETE_IS_LOCKED=true
+        fi
+    done < <(git -C "$DELETE_WT_PATH" worktree list --porcelain 2>/dev/null)
+
+    if $DELETE_IS_LOCKED; then
+        DELETE_CLASS="locked"
+        DELETE_SKIP_REASON="locked"
+        return 0
+    fi
+
+    DELETE_BRANCH_NAME=$(git -C "$DELETE_WT_PATH" symbolic-ref --short HEAD 2>/dev/null) || DELETE_IS_DETACHED=true
+    if $DELETE_IS_DETACHED; then
+        DELETE_HEAD_SHA=$(git -C "$DELETE_WT_PATH" rev-parse --short HEAD 2>/dev/null || true)
+    fi
+
+    DELETE_STATUS_OUTPUT=$(git -C "$DELETE_WT_PATH" status --porcelain 2>/dev/null) || true
+    if [[ -n "$DELETE_STATUS_OUTPUT" ]]; then
+        DELETE_DIRTY_COUNT=$(wc -l <<< "$DELETE_STATUS_OUTPUT" | tr -d ' ')
+    fi
+
+    if (( DELETE_DIRTY_COUNT > 0 )); then
+        DELETE_CLASS="dirty"
+        DELETE_RISKY=true
+        return 0
+    fi
+
+    if $DELETE_IS_DETACHED; then
+        DELETE_CLASS="detached"
+        DELETE_RISKY=true
+        return 0
+    fi
+
+    DELETE_CLASS="clean"
+}
+
+print_bulk_delete_summary_line() {
+    case "$DELETE_CLASS" in
+        clean)
+            printf '  clean     %s (%s)\n' "$DELETE_SHORT_PATH" "${DELETE_BRANCH_NAME:-branch}"
+            ;;
+        dirty)
+            if $DELETE_IS_DETACHED; then
+                printf '  dirty     %s (%s changes, detached at %s)\n' "$DELETE_SHORT_PATH" "$DELETE_DIRTY_COUNT" "${DELETE_HEAD_SHA:-HEAD}"
+            else
+                printf '  dirty     %s (%s changes on %s)\n' "$DELETE_SHORT_PATH" "$DELETE_DIRTY_COUNT" "${DELETE_BRANCH_NAME:-branch}"
+            fi
+            ;;
+        detached)
+            printf '  detached  %s (clean, detached at %s)\n' "$DELETE_SHORT_PATH" "${DELETE_HEAD_SHA:-HEAD}"
+            ;;
+        prunable)
+            if [[ -e "$DELETE_WT_PATH" ]]; then
+                printf '  prune+rm  %s (stale metadata with leftover directory)\n' "$DELETE_SHORT_PATH"
+            else
+                printf '  prune     %s (stale entry)\n' "$DELETE_SHORT_PATH"
+            fi
+            ;;
+        missing)
+            printf '  prune     %s (directory missing)\n' "$DELETE_SHORT_PATH"
+            ;;
+        locked|main|current|invalid)
+            printf '  skip      %s (%s)\n' "$DELETE_SHORT_PATH" "$DELETE_SKIP_REASON"
+            ;;
+        *)
+            printf '  skip      %s (unknown state)\n' "$DELETE_SHORT_PATH"
+            ;;
+    esac
+}
+
+execute_stale_delete_target() {
+    if [[ "$DELETE_CLASS" == "prunable" ]]; then
+        echo "${DIM}Git already marks this worktree entry as stale.${NC}"
+    else
+        echo "${DIM}Directory does not exist — pruning stale entry.${NC}"
+    fi
+
+    if prune_worktree_metadata "$DELETE_WT_PATH" "$DELETE_PREFERRED_CTX"; then
+        if [[ -e "$DELETE_WT_PATH" ]]; then
+            delete_worktree_path "$DELETE_WT_PATH" || true
+            if [[ -e "$DELETE_WT_PATH" ]]; then
+                echo "${GREEN}✓${NC} Pruned metadata"
+                return 1
+            fi
+            echo "${GREEN}✓${NC} Pruned and removed"
+        else
+            echo "${GREEN}✓${NC} Pruned"
+        fi
+        return 0
+    fi
+
+    echo "${RED}Could not find a valid git context to prune from.${NC}"
+    echo "${DIM}Try: git worktree prune --expire now (from any checkout of this repo)${NC}"
+    return 1
+}
+
+execute_live_delete_target() {
+    if (( DELETE_DIRTY_COUNT > 0 )); then
+        if git -C "$DELETE_MAIN_WT" worktree remove --force "$DELETE_WT_PATH" 2>&1; then
+            if [[ -e "$DELETE_WT_PATH" ]]; then
+                delete_worktree_path "$DELETE_WT_PATH" || true
+            fi
+        else
+            warn "git worktree remove --force failed; retrying filesystem cleanup"
+            delete_worktree_path "$DELETE_WT_PATH" || true
+            prune_worktree_metadata "$DELETE_WT_PATH" "$DELETE_MAIN_WT" || true
+        fi
+    else
+        if git -C "$DELETE_MAIN_WT" worktree remove "$DELETE_WT_PATH" 2>&1; then
+            if [[ -e "$DELETE_WT_PATH" ]]; then
+                delete_worktree_path "$DELETE_WT_PATH" || true
+            fi
+        else
+            # Mirror the single-target safeguard: a worktree that was clean at
+            # confirmation time may have picked up local changes or otherwise
+            # become unsafe to force-remove by the time we reach the delete.
+            if ! confirm_force_delete "$DELETE_WT_PATH"; then
+                DELETE_SKIP_REASON="became risky after confirmation"
+                echo "Cancelled."
+                return 10
+            fi
+
+            warn "git worktree remove failed; retrying forced cleanup"
+            if git -C "$DELETE_MAIN_WT" worktree remove --force "$DELETE_WT_PATH" 2>&1; then
+                if [[ -e "$DELETE_WT_PATH" ]]; then
+                    delete_worktree_path "$DELETE_WT_PATH" || true
+                fi
+            else
+                warn "git worktree remove --force failed; retrying filesystem cleanup"
+                delete_worktree_path "$DELETE_WT_PATH" || true
+                prune_worktree_metadata "$DELETE_WT_PATH" "$DELETE_MAIN_WT" || true
+            fi
+        fi
+    fi
+
+    if [[ -e "$DELETE_WT_PATH" ]]; then
+        return 1
+    fi
+
+    prune_worktree_metadata "$DELETE_WT_PATH" "$DELETE_MAIN_WT" || true
+    echo "${GREEN}✓${NC} Removed"
+    return 0
+}
+
+bulk_delete_execute_current_target() {
+    local initial_class="${1:?Missing initial delete class}"
+
+    case "$DELETE_CLASS" in
+        prunable|missing)
+            execute_stale_delete_target
+            return $?
+            ;;
+        clean|dirty|detached)
+            # A target that was originally summarised as clean deserves a fresh
+            # per-target confirmation before we force-remove it as dirty.
+            if [[ "$initial_class" == "clean" && "$DELETE_CLASS" == "dirty" ]]; then
+                echo "${YELLOW}Worktree changed after the bulk confirmation and now has uncommitted changes.${NC}"
+                if ! confirm_force_delete "$DELETE_WT_PATH"; then
+                    DELETE_SKIP_REASON="became dirty after confirmation"
+                    echo "Cancelled."
+                    return 10
+                fi
+            fi
+
+            execute_live_delete_target
+            return $?
+            ;;
+        locked)
+            echo "${RED}Cannot remove a locked worktree.${NC}"
+            echo "${DIM}Unlock with: git worktree unlock $(shorten_path "$DELETE_WT_PATH")${NC}"
+            return 10
+            ;;
+        main)
+            echo "${RED}Cannot remove the main worktree.${NC}"
+            return 10
+            ;;
+        current)
+            echo "${RED}Cannot remove the current worktree. cd elsewhere first.${NC}"
+            return 10
+            ;;
+        invalid)
+            if [[ "$DELETE_SKIP_REASON" == "path is not a directory" ]]; then
+                echo "${RED}Path exists but is not a directory:${NC} $DELETE_SHORT_PATH"
+            else
+                echo "${RED}Not a git worktree:${NC} $DELETE_SHORT_PATH"
+            fi
+            return 10
+            ;;
+        *)
+            echo "${RED}Unknown delete state for:${NC} $DELETE_SHORT_PATH"
+            return 1
+            ;;
+    esac
+}
+
+action_delete_targets() {
+    local selected_file="${1:?Missing selected rows file}"
+    local current_path="${2-}"
+    local preferred_ctx="${3:-}"
+    local target_mode="${4:-auto}"
+
+    if [[ "$target_mode" == "auto" ]]; then
+        resolve_action_targets "$selected_file" "$current_path"
+    else
+        resolve_action_targets_for_mode "$target_mode" "$selected_file" "$current_path"
+    fi
+
+    if (( ${#ACTION_TARGETS[@]} == 0 )); then
+        if [[ "$ACTION_TARGET_MODE" == "none" ]]; then
+            echo "${RED}No matching worktree is focused.${NC}"
+        else
+            echo "${RED}No worktrees selected.${NC}"
+        fi
+        return 1
+    fi
+
+    if [[ "$ACTION_TARGET_MODE" != "selection" ]]; then
+        action_delete "${ACTION_TARGETS[0]}" "$preferred_ctx"
+        return $?
+    fi
+
+    local needs_delete_word=false i
+    local -a initial_classes=()
+    echo "${BOLD}Selected delete/prune targets:${NC}"
+    for (( i = 0; i < ${#ACTION_TARGETS[@]}; i++ )); do
+        inspect_delete_target "${ACTION_TARGETS[$i]}" "$preferred_ctx"
+        initial_classes+=("$DELETE_CLASS")
+        print_bulk_delete_summary_line
+        if $DELETE_RISKY; then
+            needs_delete_word=true
+        fi
+    done
+
+    echo ""
+    local confirm
+    if $needs_delete_word; then
+        echo "${RED}${BOLD}Selection includes risky targets (dirty, detached, or stale leftovers).${NC}"
+        printf '%s' "${BOLD}Type 'delete' to confirm delete/prune of ${#ACTION_TARGETS[@]} worktree(s): ${NC}"
+        read -r confirm
+        [[ "$confirm" == "delete" ]] || { echo "Cancelled."; return 0; }
+    else
+        printf '%s' "${BOLD}Delete/prune ${#ACTION_TARGETS[@]} selected worktree(s)? [y/N] ${NC}"
+        read -r confirm
+        [[ "$confirm" =~ ^[yY]$ ]] || { echo "Cancelled."; return 0; }
+    fi
+
+    local -a successes=() skips=() failures=()
+    local result status short_path initial_class
+    echo ""
+    echo "${BOLD}Executing bulk delete/prune...${NC}"
+    for (( i = 0; i < ${#ACTION_TARGETS[@]}; i++ )); do
+        inspect_delete_target "${ACTION_TARGETS[$i]}" "$preferred_ctx"
+        initial_class="${initial_classes[$i]}"
+        short_path="$DELETE_SHORT_PATH"
+
+        echo ""
+        echo "${BOLD}[$(( i + 1 ))/${#ACTION_TARGETS[@]}]${NC} $short_path"
+
+        set +e
+        bulk_delete_execute_current_target "$initial_class"
+        status=$?
+        set -e
+
+        case "$status" in
+            0)
+                successes+=("$short_path — ${DELETE_CLASS}")
+                ;;
+            10)
+                skips+=("$short_path — ${DELETE_SKIP_REASON:-state changed after confirmation}")
+                ;;
+            *)
+                failures+=("$short_path — ${DELETE_CLASS}")
+                ;;
+        esac
+    done
+
+    echo ""
+    if (( ${#successes[@]} > 0 )); then
+        echo "${GREEN}${BOLD}Succeeded:${NC}"
+        printf '  %s\n' "${successes[@]}"
+    fi
+    if (( ${#skips[@]} > 0 )); then
+        echo "${YELLOW}${BOLD}Skipped:${NC}"
+        printf '  %s\n' "${skips[@]}"
+    fi
+    if (( ${#failures[@]} > 0 )); then
+        echo "${RED}${BOLD}Failed:${NC}"
+        printf '  %s\n' "${failures[@]}"
+        return 1
+    fi
+
+    return 0
+}
+
+# =============================================================================
+# fzf Dispatchers
+# =============================================================================
+#
+# These helpers do not perform Git work directly. They only answer:
+#
+#   "Given the current fzf state, what action string should fzf run next?"
+#
+# Why keep the dispatch layer separate:
+# - the bind table stays readable
+# - blocked actions are obvious and consistent
+# - production logic can be tested by running the subcommands directly
+# - future contributors can change behavior in shell without decoding a giant
+#   inline bind expression
+#
+# Not every key uses a dispatcher anymore:
+# - Enter, Ctrl-O, Ctrl-N, and Ctrl-R still need dispatcher branching
+# - Ctrl-P and Ctrl-X now use direct execute(...) bindings because that path
+#   is more reliable for interactive bulk actions than transform-emitted
+#   execute(...) chains
+#
+# Examples:
+#   FZF_SELECT_COUNT=0 ./wt --dispatch-enter /tmp/rows /path/to/focus
+#   FZF_SELECT_COUNT=0 FZF_QUERY='two words' ./wt --dispatch-space
+#
+
+dispatch_space() {
+    # Space should feel natural in both modes:
+    # - empty query: selection affordance
+    # - non-empty query: normal text entry for multi-word search
+    if [[ -z "${FZF_QUERY:-}" ]]; then
+        echo "toggle"
+    else
+        echo "put( )"
+    fi
+}
+
+dispatch_enter() {
+    local _selected_file="$1"
+    local current_path="${2-}"
+
+    if selection_active; then
+        echo "bell"
+        return 0
+    fi
+
+    [[ -n "$current_path" ]] || { echo "bell"; return 0; }
+
+    emit_become_action "$SELF" --action-enter "$current_path"
+}
+
+dispatch_open() {
+    local _selected_file="$1"
+    local current_path="${2-}"
+
+    if selection_active; then
+        echo "bell"
+        return 0
+    fi
+
+    [[ -n "$current_path" ]] || { echo "bell"; return 0; }
+
+    emit_tty_execute_action "$SELF" --action-open "$current_path"
+}
+
+dispatch_new() {
+    local _selected_file="$1"
+    local current_path="${2-}"
+    local repo_path="${3:-}" socket_path="${4:-}" activity_file="${5:-}" token_file="${6:-}" pid_file="${7:-}" pending_file="${8:-}" source_file="${9:-}" rendered_file="${10:-}" signature_file="${11:-}"
+
+    if selection_active; then
+        echo "bell"
+        return 0
+    fi
+
+    [[ -n "$current_path" ]] || { echo "bell"; return 0; }
+
+    printf '%s+%s' \
+        "$(emit_tty_execute_action "$SELF" --action-new "$current_path")" \
+        "$(emit_reload_actions "$repo_path" "$socket_path" "$activity_file" "$token_file" "$pid_file" "$pending_file" "$source_file" "$rendered_file" "$signature_file" "$_selected_file" "$current_path")"
+}
+
+dispatch_pull() {
+    local selected_file="${1:?Missing selected rows file}"
+    local current_path="${2-}"
+    local repo_path="${3:-}" socket_path="${4:-}" activity_file="${5:-}" token_file="${6:-}" pid_file="${7:-}" pending_file="${8:-}" source_file="${9:-}" rendered_file="${10:-}" signature_file="${11:-}"
+
+    if ! selection_active && [[ -z "$current_path" ]]; then
+        echo "bell"
+        return 0
+    fi
+
+    printf '%s+%s' \
+        "$(emit_tty_execute_action "$SELF" --action-pull "$selected_file" "$current_path")" \
+        "$(emit_reload_actions "$repo_path" "$socket_path" "$activity_file" "$token_file" "$pid_file" "$pending_file" "$source_file" "$rendered_file" "$signature_file" "$selected_file" "$current_path")"
+}
+
+dispatch_delete() {
+    local selected_file="${1:?Missing selected rows file}"
+    local current_path="${2-}"
+    local repo_path="${3:-}" socket_path="${4:-}" activity_file="${5:-}" token_file="${6:-}" pid_file="${7:-}" pending_file="${8:-}" source_file="${9:-}" rendered_file="${10:-}" signature_file="${11:-}"
+
+    if ! selection_active && [[ -z "$current_path" ]]; then
+        echo "bell"
+        return 0
+    fi
+
+    printf '%s+%s' \
+        "$(emit_tty_execute_action "$SELF" --action-delete-targets "$selected_file" "$current_path" "$repo_path")" \
+        "$(emit_reload_actions "$repo_path" "$socket_path" "$activity_file" "$token_file" "$pid_file" "$pending_file" "$source_file" "$rendered_file" "$signature_file" "$selected_file" "$current_path")"
+}
+
+dispatch_refresh() {
+    local _selected_file="$1" _current_path="$2"
+    local repo_path="${3:-}" socket_path="${4:-}" activity_file="${5:-}" token_file="${6:-}" pid_file="${7:-}" pending_file="${8:-}" source_file="${9:-}" rendered_file="${10:-}" signature_file="${11:-}"
+
+    if selection_active; then
+        echo "bell"
+        return 0
+    fi
+
+    emit_reload_actions "$repo_path" "$socket_path" "$activity_file" "$token_file" "$pid_file" "$pending_file" "$source_file" "$rendered_file" "$signature_file" "$_selected_file" "$_current_path"
+}
+
 # =============================================================================
 # Help & Version
 # =============================================================================
@@ -1591,20 +2667,21 @@ ${BOLD}OPTIONS${NC}
     --version           Show version
 
 ${BOLD}KEYBINDINGS${NC}
-    Enter               cd into selected worktree
-    Ctrl-O              Open in \$EDITOR
-    Ctrl-P              Pull latest (--ff-only)
-    Ctrl-N              Create new worktree
-    Ctrl-X              Delete worktree
-    Ctrl-R              Refresh list
+    Space               Toggle selection when query is empty
+    Tab / Shift-Tab     Toggle selection and move
+    Enter               cd into focused worktree (disabled under selection)
+    Ctrl-O              Open focused worktree in \$EDITOR (disabled under selection)
+    Ctrl-P              Pull focused worktree or selected worktrees
+    Ctrl-N              Create new worktree from focus (disabled under selection)
+    Ctrl-X              Delete/prune focused worktree or selected worktrees
+    Ctrl-R              Refresh list (disabled under selection)
     Ctrl-/              Toggle preview panel
 
 ${BOLD}ICONS${NC}
-    ●  Current worktree (\$PWD)
-    ○  Has branch
-    ◌  Detached HEAD
-    ✗  Prunable (stale)
-    🔒  Locked
+    □  Ordinary row
+    ■  Selected row
+    Current / detached / prunable / locked
+                       Shown by row color and the dim label text
 
 ${BOLD}SHELL INTEGRATION${NC}
     Source the wrapper for your shell for cd support:
@@ -1613,7 +2690,7 @@ ${BOLD}SHELL INTEGRATION${NC}
 
 ${BOLD}REQUIREMENTS${NC}
     git                 Required
-    fzf (0.38+)         Required (uses become())
+    fzf                 Required (recent build with --id-nth and --info-command; --listen enables background activity refresh)
 "
 }
 
@@ -1628,14 +2705,14 @@ show_version() {
 launch_fzf() {
     require_command fzf "the interactive dashboard"
 
-    local editor="${EDITOR:-vim}"
     local preview_window
     preview_window=$(choose_preview_window)
     local fzf_help
     local supports_listen=false supports_list_label=false
-    local session_dir="" socket_path="" activity_file="" token_file="" pid_file=""
-    local async_refresh_cmd="" async_refresh_bind="" async_pid=""
-    local -a listen_args=() track_args=() list_label_args=()
+    local supports_id_nth=false supports_info_command=false
+    local session_dir="" socket_path="" source_file="" rendered_file="" signature_file="" activity_file="" token_file="" pid_file="" pending_file=""
+    local async_refresh_cmd="" async_pid=""
+    local -a listen_args=() selection_args=("--multi" "--track" "--id-nth=1") list_label_args=()
     local list_label="worktrees · branch/state"
 
     # Progressive enhancement:
@@ -1648,54 +2725,67 @@ launch_fzf() {
     fzf_help=$(fzf --help 2>/dev/null || true)
     grep -Fq -- "--listen" <<< "$fzf_help" && supports_listen=true
     grep -Fq -- "--list-label" <<< "$fzf_help" && supports_list_label=true
+    grep -Fq -- "--id-nth" <<< "$fzf_help" && supports_id_nth=true
+    grep -Fq -- "--info-command" <<< "$fzf_help" && supports_info_command=true
+
+    $supports_id_nth || die "wt requires an fzf build with --id-nth support for selection-safe reloads. Upgrade fzf (tested with 0.71.0)."
+    $supports_info_command || die "wt requires an fzf build with --info-command support for selection-state feedback. Upgrade fzf (tested with 0.71.0)."
+
+    session_dir=$(mktemp -d "${TMPDIR:-/tmp}/wt.XXXXXXXX") || die "Could not create a temporary session directory"
+    source_file="$session_dir/source.list"
+    rendered_file="$session_dir/rendered.list"
+    signature_file="$session_dir/rendered.sig"
 
     # Shell-escape script/repo paths for safe embedding in fzf command strings.
-    # fzf placeholder fields like {1} are already substituted as shell-quoted
-    # strings, so we keep those raw and only quote the static path pieces here.
-    local self_q repo_q
+    # fzf placeholder fields like {1} and {+f} are already substituted as
+    # shell-quoted strings, so we keep those raw and only quote the static path
+    # pieces here.
+    local self_q repo_q socket_q source_q rendered_q signature_q activity_q token_q pid_q pending_q
     self_q=$(printf '%q' "$SELF")
-
-    local list_cmd="$self_q --list"
-    local delete_cmd="$self_q --action-delete {1}"
-    if [[ -n "${REPO_PATH:-}" ]]; then
-        repo_q=$(printf '%q' "$REPO_PATH")
-        list_cmd="$list_cmd $repo_q"
-        delete_cmd="$delete_cmd $repo_q"
-    fi
+    repo_q=$(printf '%q' "${REPO_PATH:-}")
+    socket_q=$(printf '%q' "${socket_path:-}")
+    source_q=$(printf '%q' "$source_file")
+    rendered_q=$(printf '%q' "$rendered_file")
+    signature_q=$(printf '%q' "$signature_file")
+    activity_q=$(printf '%q' "${activity_file:-}")
+    token_q=$(printf '%q' "${token_file:-}")
+    pid_q=$(printf '%q' "${pid_file:-}")
+    pending_q=$(printf '%q' "${pending_file:-}")
 
     # Async enrichment is optional. If curl is available and fzf supports a
     # local listen socket, we let fzf start with the cheap list immediately,
     # then reload the richer activity-sorted list after a background worker
     # finishes building it.
+    #
+    # The extra pending_file matters because "activity data is ready" and
+    # "activity data is safe to apply right now" are not the same thing once
+    # selection is always on.
     if command -v curl >/dev/null 2>&1 && $supports_listen; then
-        session_dir=$(mktemp -d "${TMPDIR:-/tmp}/wt.XXXXXXXX") || session_dir=""
-        if [[ -n "$session_dir" ]]; then
-            socket_path="$session_dir/fzf.sock"
-            activity_file="$session_dir/activity.list"
-            token_file="$session_dir/refresh.token"
-            pid_file="$session_dir/refresh.pid"
-            # These values are injected into fzf execute/reload strings, so
-            # quote them once up front instead of hoping the temp directory has
-            # no spaces or special shell characters.
-            local socket_q activity_q token_q pid_q
-            socket_q=$(printf '%q' "$socket_path")
-            activity_q=$(printf '%q' "$activity_file")
-            token_q=$(printf '%q' "$token_file")
-            pid_q=$(printf '%q' "$pid_file")
-            listen_args+=("--listen=$socket_path")
-            track_args+=("--track")
-            if $supports_list_label; then
-                list_label="worktrees · loading activity..."
-                async_refresh_cmd="WT_CAN_CHANGE_LIST_LABEL=1 "
-            else
-                async_refresh_cmd=""
-            fi
-            async_refresh_cmd+="$self_q --action-start-async-refresh $socket_q $activity_q $token_q $pid_q"
-            if [[ -n "${REPO_PATH:-}" ]]; then
-                async_refresh_cmd="$async_refresh_cmd $repo_q"
-            fi
-            async_refresh_bind="+execute-silent($async_refresh_cmd >/dev/null 2>&1 &)"
+        socket_path="$session_dir/fzf.sock"
+        activity_file="$session_dir/activity.list"
+        token_file="$session_dir/refresh.token"
+        pid_file="$session_dir/refresh.pid"
+        pending_file="$session_dir/activity.pending"
+        socket_q=$(printf '%q' "$socket_path")
+        activity_q=$(printf '%q' "$activity_file")
+        token_q=$(printf '%q' "$token_file")
+        pid_q=$(printf '%q' "$pid_file")
+        pending_q=$(printf '%q' "$pending_file")
+        listen_args+=("--listen=$socket_path")
+        if $supports_list_label; then
+            list_label="worktrees · loading activity..."
+            WT_CAN_CHANGE_LIST_LABEL=1
+            export WT_CAN_CHANGE_LIST_LABEL
+        else
+            unset WT_CAN_CHANGE_LIST_LABEL
         fi
+        async_refresh_cmd="$self_q --action-start-async-refresh $socket_q $activity_q $token_q $pid_q $pending_q $source_q $rendered_q $signature_q"
+        if [[ -n "${REPO_PATH:-}" ]]; then
+            async_refresh_cmd="$async_refresh_cmd $repo_q"
+        fi
+    fi
+    if ! $supports_list_label; then
+        unset WT_CAN_CHANGE_LIST_LABEL
     fi
     if $supports_list_label; then
         list_label_args+=("--list-label=$list_label")
@@ -1712,60 +2802,114 @@ launch_fzf() {
         base_display="$(shorten_path "$base_display")"
     fi
 
-    local list
-    list=$(cmd_list)
+    cmd_list > "$source_file"
 
-    if [[ -z "$list" ]]; then
+    if [[ ! -s "$source_file" ]]; then
         die "No worktrees found"
     fi
 
+    local initial_focus=""
+    initial_focus=$(first_path_from_list_file "$source_file" 2>/dev/null || true)
+    render_list_file_for_state "$source_file" "$rendered_file" "" "$initial_focus"
+    printf '%s' "$(render_signature "$source_file" "" "$initial_focus")" > "$signature_file"
+
+    local list
+    list=$(cat "$rendered_file")
+
     local header=""
     [[ -n "$base_display" ]] && header="  ${base_display}"$'\n'
-    header+="  enter:cd  ^o:editor  ^p:pull  ^n:new  ^x:delete  ^r:refresh  ^/:preview"
+    header+="  space:select  tab:toggle  enter:cd  ^o:editor  ^p:pull  ^n:new  ^x:delete  ^r:refresh  ^/:preview"
+
+    local info_cmd
+    info_cmd="$self_q --info-state"
+
+    local enter_dispatch open_dispatch new_dispatch refresh_dispatch selection_change_dispatch
+    enter_dispatch="$self_q --dispatch-enter {+f} {1}"
+    open_dispatch="$self_q --dispatch-open {+f} {1}"
+    new_dispatch="$self_q --dispatch-new {+f} {1} $repo_q $socket_q $activity_q $token_q $pid_q $pending_q $source_q $rendered_q $signature_q"
+    refresh_dispatch="$self_q --dispatch-refresh {+f} {1} $repo_q $socket_q $activity_q $token_q $pid_q $pending_q $source_q $rendered_q $signature_q"
+    selection_change_dispatch="$self_q --dispatch-selection-change $activity_q $pending_q $source_q $rendered_q $signature_q {+f} {1}"
+
+    local pull_execute_cmd pull_reload_cmd delete_execute_cmd delete_reload_cmd
+    pull_execute_cmd="$self_q --action-pull {+f} {1}"
+    pull_reload_cmd="$self_q --rendered-list-refresh $source_q $rendered_q $signature_q {+f} {1} $repo_q"
+    delete_execute_cmd="$self_q --action-delete-targets {+f} {1} $repo_q"
+    delete_reload_cmd="$self_q --rendered-list-refresh $source_q $rendered_q $signature_q {+f} {1} $repo_q"
 
     if [[ -n "$async_refresh_cmd" ]]; then
-        if $supports_list_label; then
-            WT_CAN_CHANGE_LIST_LABEL=1 "$SELF" --action-start-async-refresh "$socket_path" "$activity_file" "$token_file" "$pid_file" "${REPO_PATH:-}" \
-                >/dev/null 2>&1 &
-        else
-            "$SELF" --action-start-async-refresh "$socket_path" "$activity_file" "$token_file" "$pid_file" "${REPO_PATH:-}" \
-                >/dev/null 2>&1 &
-        fi
+        "$SELF" --action-start-async-refresh "$socket_path" "$activity_file" "$token_file" "$pid_file" "$pending_file" "$source_file" "$rendered_file" "$signature_file" "${REPO_PATH:-}" \
+            >/dev/null 2>&1 &
         async_pid=$!
     fi
 
     local result
+    local -a fzf_args=()
     # printf is intentional here:
     # - echo has implementation-specific edge cases
     # - the list payload is already complete text
     # - printf keeps the startup path boring and predictable
-    result=$(printf '%s\n' "$list" | fzf \
-        --ansi \
-        --delimiter=$'\x1f' \
-        --with-nth=2 \
-        "${listen_args[@]}" \
-        "${track_args[@]}" \
-        --preview="$self_q --preview {1}" \
-        --preview-window="$preview_window" \
-        --header="$header" \
-        --header-first \
-        "${list_label_args[@]}" \
-        --reverse \
-        --no-sort \
-        --no-multi \
-        --bind="enter:become(echo {1})" \
-        --bind="ctrl-o:execute($editor {1})" \
-        --bind="ctrl-p:execute(git -C {1} pull --ff-only)+reload($list_cmd)${async_refresh_bind}" \
-        --bind="ctrl-r:reload($list_cmd)${async_refresh_bind}" \
-        --bind="ctrl-n:execute($self_q --action-new {1} </dev/tty >/dev/tty 2>&1)+reload($list_cmd)${async_refresh_bind}" \
-        --bind="ctrl-x:execute($delete_cmd </dev/tty >/dev/tty 2>&1)+reload($list_cmd)${async_refresh_bind}" \
-        --bind="ctrl-/:toggle-preview" \
-        --pointer="▶" \
-        --prompt="worktree▶ " \
-    ) || true
+    #
+    # Keep comments OUTSIDE the backslash-continued fzf invocation below.
+    # In bash, a trailing "\" escapes the newline, so an inline comment line
+    # inside the continued command can accidentally comment out the rest of the
+    # logical command line and turn later fzf options into standalone shell
+    # commands.
+    #
+    # Field 1 is the canonical path and therefore the stable identity.
+    # fzf can preserve both focus and selection across reload-sync by matching
+    # that hidden field instead of trusting row order.
+    #
+    # The "multi" event fires whenever the selected set changes. We use it to
+    # update the visible state cells and to apply a deferred activity refresh
+    # after selection clears.
+    #
+    # The custom left state cell now lives inside the rendered row text, so we
+    # intentionally keep fzf's own gutter, marker, and pointer columns blank.
+    # Focus is shown by row highlight only; the state cell itself only encodes
+    # ordinary vs selected.
+    fzf_args=(
+        --ansi
+        --delimiter=$'\x1f'
+        --with-nth=2
+    )
+    if (( ${#listen_args[@]} > 0 )); then
+        fzf_args+=( "${listen_args[@]}" )
+    fi
+    fzf_args+=( "${selection_args[@]}" )
+    fzf_args+=(
+        --preview="$self_q --preview-dispatch {+f} {1}"
+        --preview-window="$preview_window"
+        --header="$header"
+        --header-first
+        --info-command="$info_cmd"
+    )
+    if (( ${#list_label_args[@]} > 0 )); then
+        fzf_args+=( "${list_label_args[@]}" )
+    fi
+    fzf_args+=(
+        --reverse
+        --no-sort
+        --gutter=" "
+        --marker=""
+        --bind="space:transform:$self_q --dispatch-space"
+        --bind="tab:toggle+down,btab:toggle+up"
+        --bind="multi:transform:$selection_change_dispatch"
+        --bind="enter:transform:$enter_dispatch"
+        --bind="ctrl-o:transform:$open_dispatch"
+        --bind="ctrl-p:execute($pull_execute_cmd </dev/tty >/dev/tty 2>&1)+reload-sync($pull_reload_cmd)$( [[ -n "$async_refresh_cmd" ]] && printf '+execute-silent(%s >/dev/null 2>&1 &)' "$async_refresh_cmd" )"
+        --bind="ctrl-r:transform:$refresh_dispatch"
+        --bind="ctrl-n:transform:$new_dispatch"
+        --bind="ctrl-x:execute($delete_execute_cmd </dev/tty >/dev/tty 2>&1)+reload-sync($delete_reload_cmd)$( [[ -n "$async_refresh_cmd" ]] && printf '+execute-silent(%s >/dev/null 2>&1 &)' "$async_refresh_cmd" )"
+        --bind="ctrl-/:toggle-preview"
+        --pointer=""
+        --prompt="worktree▶ "
+    )
+
+    result=$(printf '%s\n' "$list" | fzf "${fzf_args[@]}") || true
 
     if [[ -n "$async_pid" ]]; then
         kill "$async_pid" >/dev/null 2>&1 || true
+        wait "$async_pid" 2>/dev/null || true
     fi
     if [[ -f "$pid_file" ]]; then
         local refresh_pid
@@ -1773,6 +2917,7 @@ launch_fzf() {
         if [[ "$refresh_pid" =~ ^[0-9]+$ ]] && kill -0 "$refresh_pid" 2>/dev/null; then
             kill "$refresh_pid" >/dev/null 2>&1 || true
         fi
+        [[ "$refresh_pid" =~ ^[0-9]+$ ]] && wait "$refresh_pid" 2>/dev/null || true
         rm -f "$pid_file"
     fi
     if [[ -n "$session_dir" ]]; then
@@ -1805,6 +2950,10 @@ main() {
             cmd_preview "${2:?Missing worktree path for --preview}"
             return 0
             ;;
+        --preview-dispatch)
+            cmd_preview_dispatch "${2:?Missing selected rows file}" "${3-}"
+            return 0
+            ;;
         --list)
             REPO_PATH="${2:-}"
             cmd_list
@@ -1815,6 +2964,66 @@ main() {
             cmd_list_activity
             return 0
             ;;
+        --rendered-list-from-source)
+            rendered_list_from_source "${2:?Missing source list file}" "${3:?Missing rendered list file}" "${4:?Missing render signature file}" "${5:-}" "${6:-}"
+            return 0
+            ;;
+        --rendered-list-refresh)
+            rendered_list_refresh "${2:?Missing source list file}" "${3:?Missing rendered list file}" "${4:?Missing render signature file}" "${5:-}" "${6:-}" "${7:-}"
+            return 0
+            ;;
+        --info-state)
+            info_state
+            return 0
+            ;;
+        --dispatch-space)
+            dispatch_space
+            return 0
+            ;;
+        --dispatch-enter)
+            dispatch_enter "${2:?Missing selected rows file}" "${3-}"
+            return 0
+            ;;
+        --dispatch-open)
+            dispatch_open "${2:?Missing selected rows file}" "${3-}"
+            return 0
+            ;;
+        --dispatch-selection-change)
+            dispatch_selection_change "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}"
+            return 0
+            ;;
+        --dispatch-render-state)
+            dispatch_render_state "${2:?Missing source list file}" "${3:?Missing rendered list file}" "${4:?Missing render signature file}" "${5:-}" "${6:-}"
+            return 0
+            ;;
+        --dispatch-new)
+            dispatch_new "${2:?Missing selected rows file}" "${3-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}" "${10:-}" "${11:-}" "${12:-}"
+            return 0
+            ;;
+        --dispatch-pull)
+            dispatch_pull "${2:?Missing selected rows file}" "${3-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}" "${10:-}" "${11:-}" "${12:-}"
+            return 0
+            ;;
+        --dispatch-delete)
+            dispatch_delete "${2:?Missing selected rows file}" "${3-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}" "${10:-}" "${11:-}" "${12:-}"
+            return 0
+            ;;
+        --dispatch-refresh)
+            dispatch_refresh "${2:?Missing selected rows file}" "${3-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}" "${10:-}" "${11:-}" "${12:-}"
+            return 0
+            ;;
+        --action-enter)
+            action_enter "${2:?Missing worktree path for --action-enter}"
+            return 0
+            ;;
+        --action-open)
+            action_open "${2:?Missing worktree path for --action-open}"
+            return 0
+            ;;
+        --action-pull)
+            action_pull "${2:?Missing selected rows file}" "${3-}" "${4:-auto}"
+            return 0
+            ;;
         --action-new)
             action_new "${2:?Missing worktree path for --action-new}"
             return 0
@@ -1823,12 +3032,16 @@ main() {
             action_delete "${2:?Missing worktree path for --action-delete}" "${3:-}"
             return 0
             ;;
+        --action-delete-targets)
+            action_delete_targets "${2:?Missing selected rows file}" "${3-}" "${4:-}" "${5:-auto}"
+            return 0
+            ;;
         --action-start-async-refresh)
-            start_async_refresh "${2:?Missing fzf socket path}" "${3:?Missing activity output path}" "${4:?Missing refresh token file}" "${5:?Missing refresh pid file}" "${6:-}"
+            start_async_refresh "${2:?Missing fzf socket path}" "${3:?Missing activity output path}" "${4:?Missing refresh token file}" "${5:?Missing refresh pid file}" "${6:?Missing pending refresh file}" "${7:?Missing source list file}" "${8:?Missing rendered list file}" "${9:?Missing render signature file}" "${10:-}"
             return 0
             ;;
         --action-async-refresh)
-            action_async_refresh "${2:?Missing fzf socket path}" "${3:?Missing activity output path}" "${4:?Missing refresh token file}" "${5:?Missing refresh token}" "${6:-}"
+            action_async_refresh "${2:?Missing fzf socket path}" "${3:?Missing activity output path}" "${4:?Missing refresh token file}" "${5:?Missing refresh token}" "${6:?Missing pending refresh file}" "${7:?Missing source list file}" "${8:?Missing rendered list file}" "${9:?Missing render signature file}" "${10:-}"
             return 0
             ;;
         -*)
