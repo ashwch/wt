@@ -22,7 +22,7 @@ set -euo pipefail
 # Configuration
 # =============================================================================
 
-readonly VERSION="0.2.0"
+readonly VERSION="0.3.0"
 
 # Resolve absolute path to this script for fzf callbacks
 _resolve_self() {
