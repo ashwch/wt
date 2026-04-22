@@ -8,6 +8,7 @@ available.
 ## Features
 
 - **Interactive dashboard** — Browse all worktrees with fzf split panel
+- **Always-on multi-select** — `Space`, `Tab`, and `Shift-Tab` build a trusted target set without leaving the list
 - **Rich preview** — Branch info, recent commits, submodule status, working tree changes
 - **Keyboard-driven** — Create, delete, pull, and open worktrees without leaving the TUI
 - **Submodule-aware** — Shows sync status for repos with submodules
@@ -15,6 +16,9 @@ available.
 - **Adaptive layout** — Keeps the worktree path visible in the list and moves the preview below on narrower terminals
 - **Shell integration** — Press Enter to cd directly into a worktree
 - **Minimal dependencies** — bash, git, fzf, and standard POSIX utilities
+
+`wt` now relies on `fzf` support for `--id-nth` and `--info-command`. The
+selection model in this README was verified against `fzf 0.71.0`.
 
 ## Install
 
@@ -197,13 +201,18 @@ To make that behavior legible in the UI:
   `worktrees · loading activity...`
 - once the background refresh lands, the label changes to
   `worktrees · latest activity`
+- if a selection is active when the richer list finishes building, `wt`
+  defers applying it until the selection clears so the target set does not
+  shift under the user mid-action
 
 This is also a compatibility story, not just a speed story:
 
 - On newer `fzf` builds that support `--listen`, `wt` can refresh the list in
   place after startup.
-- On older `fzf` builds, `wt` still works. You keep the fast branch/state list
-  and the rich per-row preview, just without the automatic in-place upgrade.
+- `wt` now depends on stable identity tracking support from `fzf`
+  (`--id-nth`) so selection-aware reloads stay trustworthy.
+- If `--listen` is unavailable, you still keep the fast branch/state list and
+  the rich per-row preview, just without the automatic in-place upgrade.
 
 If multiple refreshes are triggered quickly, `wt` only accepts the newest
 background result. Older in-flight refreshes are discarded so the list does not
@@ -425,15 +434,184 @@ zizmor --persona regular .github/workflows
 
 ## Keybindings
 
+Multi-selection is always on. The dashboard starts in the familiar
+zero-selection mode, but the moment anything is selected it becomes
+selection-targeted:
+
+- `Ctrl-P` and `Ctrl-X` operate on the selected set
+- `Enter`, `Ctrl-O`, `Ctrl-N`, and `Ctrl-R` are disabled until selection clears
+- `Space` only toggles selection when the query is empty; otherwise it types a literal space
+- `Tab` and `Shift-Tab` always toggle selection and move
+
 | Key | Action |
 |-----|--------|
-| `Enter` | cd into selected worktree |
-| `Ctrl-O` | Open in `$EDITOR` |
-| `Ctrl-P` | Pull latest (`--ff-only`) |
-| `Ctrl-N` | Create new worktree |
-| `Ctrl-X` | Delete worktree |
-| `Ctrl-R` | Refresh list |
+| `Space` | Toggle selection when the query is empty |
+| `Tab` / `Shift-Tab` | Toggle selection and move |
+| `Enter` | cd into the focused worktree when no selection is active |
+| `Ctrl-O` | Open the focused worktree in `$EDITOR` when no selection is active |
+| `Ctrl-P` | Pull the focused worktree or all selected worktrees |
+| `Ctrl-N` | Create a new worktree from the focused row when no selection is active |
+| `Ctrl-X` | Delete/prune the focused worktree or all selected worktrees |
+| `Ctrl-R` | Refresh the list when no selection is active |
 | `Ctrl-/` | Toggle preview panel |
+
+The left state column is now rendered directly into each visible row instead
+of using fzf's separate pointer and marker columns. That gives each row one
+clear state glyph instead of stacked symbols:
+
+- `□` ordinary row
+- `■` selected row
+
+Focus is shown by the normal row highlight, not by adding a second symbol into
+the state cell.
+The row body itself does not use a second icon language anymore. Current,
+detached, prunable, and locked states are conveyed through row color plus the
+dim right-hand label instead of sprinkling extra symbols into some rows.
+
+## Selection Model
+
+The multi-select behavior is easiest to understand if you think in terms of
+target sets instead of keys.
+
+There are only three real target modes:
+
+```text
+No selection + focused row        => target = focused row
+Active selection                  => target = selected rows
+No selection + no focused match   => target = nothing
+```
+
+Why model it this way:
+
+- the old dashboard was always "focused row"
+- always-on multi-select adds a real second target mode
+- a zero-match query is not "focused row" or "selected rows"; it is "nothing"
+
+That is why `wt` now has dispatch helpers in the code instead of putting all
+the logic inline in the fzf bind strings. Every action answers the same
+question first:
+
+```text
+What is the target set right now?
+```
+
+And every visible row answers a second question directly in the UI:
+
+```text
+What is this row's current state cell right now?
+```
+
+That row-state cell is now custom-rendered in the row text, not delegated to
+fzf's native pointer/marker columns. We took that route because native fzf
+always draws focus and selection in separate columns, which made the left edge
+look noisy and impossible to tune into a clean "empty box / filled box"
+language.
+
+### Why hidden field 1 matters
+
+Each list row still starts with the canonical worktree path in hidden field 1.
+
+```text
+[field 1: canonical path]  [field 2: visible row text]
+```
+
+Why keep that hidden identity field:
+
+- the visible row can change shape when activity data arrives
+- row order can change after the async activity refresh
+- the worktree path is the stable identity that survives those changes
+
+That is why `wt` now asks fzf to track identity with `--id-nth=1`.
+
+### Why the state cell is custom-rendered
+
+The leftmost state cell is no longer fzf's own pointer or marker.
+
+Why:
+
+- native fzf draws focus and selection in separate columns
+- that means you get stacked symbols instead of one coherent state cell
+- the UI we wanted was one state glyph per row, not "pointer plus marker plus row icon"
+
+So `wt` now keeps:
+
+- a base list file with stable hidden identity in field 1
+- a rendered list file that prepends exactly one state glyph to field 2
+- a small render signature so focus and selection changes only redraw the list
+  when the visible state actually changed
+
+### Why bulk actions use `{+f}`
+
+Bulk actions do not receive selected rows as inline argv expansion.
+They receive a temp file path from `{+f}`.
+
+Why:
+
+- selected sets can be long
+- inline argv expansion can hit shell length limits
+- one temp file keeps the downstream shell code simple and deterministic
+
+You can inspect what fzf passes with commands like:
+
+```bash
+# Show the raw list rows, including the hidden field-1 separator (^_)
+./wt --list /path/to/repo | sed -n 'l'
+
+# Simulate a selected-row temp file and preview how wt will interpret it
+tmp=$(mktemp)
+./wt --list /path/to/repo | head -2 > "$tmp"
+FZF_SELECT_COUNT=2 ./wt --preview-dispatch "$tmp" /path/to/focused
+rm -f "$tmp"
+```
+
+### Why refresh is deferred under selection
+
+The async activity refresh still builds in the background, but `wt` no longer
+blindly applies it as soon as it is ready.
+
+Why not:
+
+- activity refresh can reorder the list
+- reordering while the user is building a selected set undermines trust
+- preserving identity is necessary, but it is not the whole UX story
+
+So the rule is:
+
+```text
+activity data ready + no active selection  => apply refresh now
+activity data ready + active selection     => mark refresh as pending
+selection clears                           => apply the pending refresh
+```
+
+That design keeps startup fast without making selection feel slippery.
+
+### Internal debug commands
+
+These commands are useful when reading or modifying the selection code:
+
+```bash
+# Raw startup list (cheap path)
+./wt --list /path/to/repo
+
+# Activity-sorted list (expensive path)
+./wt --list-activity /path/to/repo
+
+# Rich single-row preview
+./wt --preview /path/to/worktree
+
+# Selection-aware preview dispatcher
+tmp=$(mktemp)
+./wt --list /path/to/repo | head -2 > "$tmp"
+FZF_SELECT_COUNT=2 ./wt --preview-dispatch "$tmp" /path/to/focused
+rm -f "$tmp"
+
+# Bulk pull and bulk delete consume selected rows from a temp file
+tmp=$(mktemp)
+./wt --list /path/to/repo | head -2 > "$tmp"
+FZF_SELECT_COUNT=2 ./wt --action-pull "$tmp" /path/to/focused
+FZF_SELECT_COUNT=2 ./wt --action-delete-targets "$tmp" /path/to/focused /path/to/repo
+rm -f "$tmp"
+```
 
 ## Delete Behavior
 
@@ -539,11 +717,11 @@ git -C /path/to/another/checkout worktree prune --expire now
 
 | Icon | Meaning |
 |------|---------|
-| `●` | Current worktree (green) |
-| `○` | Has branch (blue) |
-| `◌` | Detached HEAD (yellow) |
-| `✗` | Prunable / stale (red) |
-| `🔒` | Locked (dim) |
+| `□` | Ordinary row in the selection state column |
+| `■` | Selected row in the selection state column |
+
+Current, detached, prunable, and locked are now shown by row color plus the
+dim label text, not by additional body icons.
 
 ## Shell Integration
 
