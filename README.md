@@ -71,6 +71,97 @@ wt -h               # Show help
 wt --version        # Show version
 ```
 
+## Demo
+
+GitHub renders animated GIFs reliably, so the README uses GIF previews first.
+The matching asciinema casts are kept in the repo as the higher-fidelity,
+terminal-native source demos for local replay.
+
+### Overview
+
+![wt overview demo](docs/assets/wt-demo-overview.gif)
+
+Shows:
+- browsing a richer worktree list
+- different worktree ages and preview states
+- the default dashboard flow before selection starts
+
+Replay locally:
+
+```bash
+asciinema play docs/assets/wt-demo-overview.cast
+```
+
+### Multi-Selection
+
+![wt selection demo](docs/assets/wt-demo-selection.gif)
+
+Shows:
+- always-on multi-selection with `Tab`
+- visible `□` / `■` row state cells
+- off-target preview behavior and the bulk-target summary
+
+Replay locally:
+
+```bash
+asciinema play docs/assets/wt-demo-selection.cast
+```
+
+### Bulk Pull
+
+![wt bulk pull demo](docs/assets/wt-demo-bulk-pull.gif)
+
+Shows:
+- selecting multiple worktrees
+- running `Ctrl-P` against the selected set
+- the dashboard returning to the updated list afterward
+
+Replay locally:
+
+```bash
+asciinema play docs/assets/wt-demo-bulk-pull.cast
+```
+
+### Bulk Delete
+
+![wt bulk delete demo](docs/assets/wt-demo-bulk-delete.gif)
+
+Shows:
+- selecting multiple worktrees
+- opening the bulk delete confirmation flow with `Ctrl-X`
+- stepping through the delete path in a disposable demo repo
+
+Replay locally:
+
+```bash
+asciinema play docs/assets/wt-demo-bulk-delete.cast
+```
+
+For convenience, the overview cast is also copied to:
+
+```text
+docs/assets/wt-demo.cast
+```
+
+Regenerate the demo suite from disposable `/tmp` worktree setups:
+
+```bash
+# all demos
+./scripts/record-demo-cast.sh all
+
+# one demo
+./scripts/record-demo-cast.sh selection
+
+# rebuild the GitHub-friendly GIF previews from the casts
+./scripts/render-demo-gifs.sh all
+```
+
+Why the recorder uses throwaway `/tmp` repos:
+
+- the demos stay safe and reproducible
+- the worktree names and paths stay short enough to read in the cast
+- the recordings can show selection, preview, pull, and delete behavior without touching a real repo
+
 ## Dependency Model
 
 The dependency story is intentionally simple:
